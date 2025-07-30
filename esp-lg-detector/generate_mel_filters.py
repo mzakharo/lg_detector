@@ -16,7 +16,7 @@ def generate_mel_filterbank_header(filename="mel_filters.h"):
         n_mels=N_MELS,
         fmin=FMIN,
         fmax=FMAX,
-        norm=None, # Use 'slaney' norm if your training used it
+        norm='slaney', # Use 'slaney' norm if your training used it
     ).T # Transpose to get shape [n_fft // 2 + 1, n_mels]
 
     with open(filename, 'w') as f:
