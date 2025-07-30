@@ -111,15 +111,15 @@ void init_pdm_microphone() {
         .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
         .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .clk = (gpio_num_t)PDM_CLK_PIN,
-            .din = (gpio_num_t)PDM_DATA_PIN,
+            .clk = PDM_CLK_PIN,
+            .din = PDM_DATA_PIN,
             .invert_flags = {
                 .clk_inv = false,
             },
         },
     };
         // Configure for mono recording (single microphone)
-    //pdm_rx_cfg.slot_cfg.slot_mask = I2S_PDM_SLOT_LEFT;  // Use left slot
+    pdm_rx_cfg.slot_cfg.slot_mask = I2S_PDM_SLOT_LEFT;  // Use left slot
  
 
     ESP_ERROR_CHECK(i2s_channel_init_pdm_rx_mode(rx_chan, &pdm_rx_cfg));
@@ -690,44 +690,13 @@ void spectrogram_task(void* arg) {
                         ESP_LOGW(TAG, "Cannot advance extraction head, would exceed available data");
                     }
 
-                    // Generate one spectrogram column and convert to dB immediately (matching Python behavior)
+                    // Generate one spectrogram column (keep as power values for now)
                     float* current_column = &spectrogram_buffer[spectrogram_col_head * N_MELS];
                     
                     generate_spectrogram_frame(audio_frame_buffer, current_column, fft_work_buffer);
 
-                    // CRITICAL FIX: Apply dB conversion immediately per column (matching librosa behavior)
-                    // This matches librosa.power_to_db(spectrogram, ref=np.max) on individual frames
-                    
-                    // 1. Find the maximum value in this column
-                    float max_power = 0.0f;
-                    for (int i = 0; i < N_MELS; i++) {
-                        if (current_column[i] > max_power) {
-                            max_power = current_column[i];
-                        }
-                    }
-                    
-                    // Prevent division by zero
-                    if (max_power <= 0.0f) {
-                        max_power = 1e-10f;
-                    }
-                    
-                    // 2. Convert this column to dB using its own maximum as reference
-                    const float amin = 1e-10f;
-                    const float top_db = 80.0f;
-                    
-                    for (int i = 0; i < N_MELS; i++) {
-                        float power_val = fmaxf(amin, current_column[i]);
-                        
-                        // Convert to dB: 10 * log10(S / max_power)
-                        float db_val = 10.0f * log10f(power_val / max_power);
-                        
-                        // Apply top_db clipping (standard in librosa)
-                        if (db_val < -top_db) {
-                            db_val = -top_db;
-                        }
-                        
-                        current_column[i] = db_val;
-                    }
+                    // NOTE: dB conversion will be done globally when we have a full spectrogram
+                    // This matches librosa.power_to_db(spectrogram, ref=np.max) behavior
 
                     // DEBUG: Log spectrogram column statistics to verify it's updating
                     static int debug_counter = 0;
@@ -771,12 +740,45 @@ void spectrogram_task(void* arg) {
 
                         if (!is_in_cooldown) {
                             // Rearrange spectrogram buffer for model input (columns in chronological order)
-                            // The data is already in dB format from per-column conversion above
                             for (int col = 0; col < SPECTROGRAM_WIDTH; col++) {
                                 int src_col = (spectrogram_col_head + col) % SPECTROGRAM_WIDTH;
                                 memcpy(&model_input_buffer[col * N_MELS], &spectrogram_buffer[src_col * N_MELS], N_MELS * sizeof(float));
                             }
-#if 0
+                            
+                            // CRITICAL FIX: Apply dB conversion using fixed reference
+                            // This avoids the issue where low-frequency noise dominates the global maximum
+                            
+                            // 1. Find the global maximum power across the entire spectrogram
+                            float global_max_power = 0.0f;
+                            for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
+                                if (model_input_buffer[i] > global_max_power) {
+                                    global_max_power = model_input_buffer[i];
+                                }
+                            }
+                            
+                            // Prevent division by zero
+                            if (global_max_power <= 0.0f) {
+                                global_max_power = 1e-10f;
+                            }
+                            
+                            // 2. Convert entire spectrogram to dB using global maximum as reference
+                            const float amin = 1e-10f;
+                            const float top_db = 80.0f;
+                            
+                            for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
+                                float power_val = fmaxf(amin, model_input_buffer[i]);
+                                
+                                // Convert to dB: 10 * log10(S / global_max_power)
+                                float db_val = 10.0f * log10f(power_val / global_max_power);
+                                
+                                // Apply top_db clipping (standard in librosa)
+                                if (db_val < -top_db) {
+                                    db_val = -top_db;
+                                }
+                                
+                                model_input_buffer[i] = db_val;
+                            }
+#if 1
                             // --- DEBUG: Print the entire model input buffer for comparison ---
                             // CRITICAL FIX: Output in row-major order (frequency x time) to match Python expectation
                             printf("--- C++ SPECTROGRAM START ---\\n");
