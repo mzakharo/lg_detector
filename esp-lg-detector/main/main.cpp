@@ -132,7 +132,7 @@ void init_pdm_microphone() {
 // --- FIXED: Spectrogram Generation and Detection Task ---
 void init_tflite();
 // REVISED SIGNATURE: Passes a work buffer to avoid stack overflow
-void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectrogram, float* fft_work_buffer);
+void generate_spectrogram_frame(const int16_t* audio_frame, float* out_mel_spectrogram, int16_t* fft_work_buffer);
 
 #if DEBUG_MODE == 1
 // --- DEBUG: Microphone Testing Task ---
@@ -477,7 +477,7 @@ void spectrogram_task(void* arg) {
     
     // Audio ring buffer for FFT frames (only need N_FFT samples + some overlap)
     constexpr int AUDIO_RING_SIZE = N_FFT * 2; // Double buffer for overlap
-    float* audio_ring_buffer = (float*)malloc(AUDIO_RING_SIZE * sizeof(float));
+    int16_t* audio_ring_buffer = (int16_t*)malloc(AUDIO_RING_SIZE * sizeof(int16_t));
     int audio_ring_head = 0;
     int audio_ring_count = 0;
     
@@ -488,10 +488,10 @@ void spectrogram_task(void* arg) {
     
     // CRITICAL FIX: Allocate the FFT work buffer in internal RAM for the DSP library.
     // ESP-DSP real FFT requires 2*N_FFT buffer size for complex output
-    float* fft_work_buffer = (float*)heap_caps_malloc(2 * N_FFT * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t* fft_work_buffer = (int16_t*)heap_caps_malloc(2 * N_FFT * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
     // STACK OVERFLOW FIX: Allocate audio frame buffer on heap instead of stack
-    float* audio_frame_buffer = (float*)malloc(N_FFT * sizeof(float));
+    int16_t* audio_frame_buffer = (int16_t*)malloc(N_FFT * sizeof(int16_t));
     
     // STACK OVERFLOW FIX: Allocate model input buffer on heap instead of stack
     float* model_input_buffer = (float*)malloc(N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
@@ -540,7 +540,7 @@ void spectrogram_task(void* arg) {
             // 2. Add new samples to the audio ring buffer
             for (int i = 0; i < samples_read; i++) {
                 // Convert and add sample to ring buffer
-                audio_ring_buffer[audio_ring_head] = (float)i2s_read_buffer[i] / 32768.0f;
+                audio_ring_buffer[audio_ring_head] = i2s_read_buffer[i];
                 audio_ring_head = (audio_ring_head + 1) % AUDIO_RING_SIZE;
                 
                 if (audio_ring_count < AUDIO_RING_SIZE) {
@@ -561,7 +561,7 @@ void spectrogram_task(void* arg) {
                     }
 
                     // --- Pre-processing: DC Offset Removal and Normalization ---
-                    float mean = 0.0f;
+                    int32_t mean = 0;
                     for (int j = 0; j < N_FFT; j++) {
                         mean += audio_frame_buffer[j];
                     }
@@ -641,7 +641,7 @@ void spectrogram_task(void* arg) {
 
 extern "C" void app_main() {
     ESP_LOGI(TAG, "Initializing FFT tables for N_FFT=%d...", N_FFT);
-    esp_err_t ret = dsps_fft2r_init_fc32(NULL, N_FFT);
+    esp_err_t ret = dsps_fft2r_init_sc16(NULL, N_FFT);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "FFT init failed: %s", esp_err_to_name(ret));
         return;
@@ -748,20 +748,20 @@ void init_tflite() {
 
 // --- FIXED: generate_spectrogram_frame() function ---
 // REVISED to accept a work buffer, preventing stack overflow.
-void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectrogram, float* fft_work_buffer) {
+void generate_spectrogram_frame(const int16_t* audio_frame, float* out_mel_spectrogram, int16_t* fft_work_buffer) {
     // 1. Copy audio frame to the heap-allocated work buffer
-    memcpy(fft_work_buffer, audio_frame, N_FFT * sizeof(float));
+    memcpy(fft_work_buffer, audio_frame, N_FFT * sizeof(int16_t));
 
     // 2. Perform FFT using ESP-DSP library
     
     // CRITICAL FIX: ESP-DSP real FFT requires a buffer of size 2*N_FFT for complex output
     // We need to zero-pad the second half for the imaginary components
     for (int i = N_FFT; i < N_FFT * 2; i++) {
-        fft_work_buffer[i] = 0.0f;
+        fft_work_buffer[i] = 0;
     }
     
     // Perform the real-to-complex FFT
-    esp_err_t fft_result = dsps_fft2r_fc32(fft_work_buffer, N_FFT);
+    esp_err_t fft_result = dsps_fft2r_sc16(fft_work_buffer, N_FFT);
     
     
     if (fft_result != ESP_OK) {
@@ -774,15 +774,15 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
     }
     
     // Apply bit reversal to get the correct frequency order
-    dsps_bit_rev_fc32(fft_work_buffer, N_FFT);
+    dsps_bit_rev_sc16_ansi(fft_work_buffer, N_FFT);
     
 
     // 3. Calculate Power Spectrum from FFT output
-    power_spectrum[0] = fft_work_buffer[0] * fft_work_buffer[0]; // DC
+    power_spectrum[0] = (double)fft_work_buffer[0] * (double)fft_work_buffer[0]; // DC
     for (int i = 1; i < N_FFT / 2; i++) {
-        power_spectrum[i] = fft_work_buffer[i * 2] * fft_work_buffer[i * 2] + fft_work_buffer[i * 2 + 1] * fft_work_buffer[i * 2 + 1];
+        power_spectrum[i] = (double)fft_work_buffer[i * 2] * (double)fft_work_buffer[i * 2] + (double)fft_work_buffer[i * 2 + 1] * (double)fft_work_buffer[i * 2 + 1];
     }
-    power_spectrum[N_FFT / 2] = fft_work_buffer[1] * fft_work_buffer[1]; // Nyquist
+    power_spectrum[N_FFT / 2] = (double)fft_work_buffer[1] * (double)fft_work_buffer[1]; // Nyquist
     
 
     // 4. Apply Mel Filterbank with overflow protection
