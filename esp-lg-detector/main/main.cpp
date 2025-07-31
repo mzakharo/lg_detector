@@ -13,7 +13,7 @@
 #include "esp_heap_caps.h" // For heap_caps_malloc
 
 // DEBUG MODE: 0=normal, 1=microphone test, 2=spectrogram debug, 3=sine wave test, 4=dump audio
-#define DEBUG_MODE 3
+#define DEBUG_MODE 0
 #include "test_vector.h"
 // TensorFlow Lite Micro
 #include "tensorflow/lite/micro/micro_interpreter.h"
@@ -831,7 +831,7 @@ void spectrogram_task(void* arg) {
                                 }
                                 model_input_buffer[i] = db_val;
                             }
-#if 1
+#if 0
                             // --- DEBUG: Print the entire model input buffer for comparison ---
                             // CORRECTED: Output in [time, frequency] format to match actual memory layout
                             printf("--- C++ SPECTROGRAM START ---\\n");
@@ -1078,7 +1078,7 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
         } else if (mel_value < 0.0) {
             out_mel_spectrogram[i] = 0.0f;
         } else {
-            out_mel_spectrogram[i] = (float)mel_value;
+            out_mel_spectrogram[i] = local_power_spectrum[4*i] + local_power_spectrum[4*i+1] + local_power_spectrum[4*i+2] + local_power_spectrum[4*i+3];
         }
     } 
 }
