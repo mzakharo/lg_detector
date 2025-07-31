@@ -119,6 +119,7 @@ def main():
                         interpreter.invoke()
                         prediction = interpreter.get_tensor(output_details[0]['index'])[0]
                         
+                        print('prediction', prediction)
                         # Assuming the 'lg_melody' class is the second one
                         melody_prob = prediction[1]
 

@@ -43,7 +43,7 @@
 #define LG_MELODY_CLASS_INDEX 1
 
 // --- DEBUG CONFIGURATION ---
-#define DEBUG_LEVEL 3 // 0=none, 1=basic, 2=verbose, 3=spectrogram_dump
+#define DEBUG_LEVEL 2 // 0=none, 1=basic, 2=verbose, 3=spectrogram_dump
 
 // --- TASK PRIORITIES ---
 #define AUDIO_CAPTURE_TASK_PRIORITY 5

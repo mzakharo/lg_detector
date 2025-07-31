@@ -12,7 +12,7 @@
 
 // Include the model data
 #include "model_data.h"
-
+#include "test_vector.h"
 static const char *TAG = "TFLITE_INFERENCE";
 
 // TensorFlow Lite Micro globals
@@ -22,7 +22,7 @@ namespace {
     TfLiteTensor* input = nullptr;
     TfLiteTensor* output = nullptr;
     
-    constexpr int kTensorArenaSize = 2 * 1024 * 1024;  // 2MB tensor arena
+    constexpr int kTensorArenaSize = 100 * 1024;  // 2MB tensor arena
     uint8_t* tensor_arena = nullptr;
     
     bool is_initialized = false;
@@ -32,14 +32,11 @@ esp_err_t tflite_inference_init(void) {
     ESP_LOGI(TAG, "Initializing TensorFlow Lite Micro inference...");
     
     // Allocate tensor arena in PSRAM if available, otherwise internal RAM
-    tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (tensor_arena == nullptr) {
-        ESP_LOGW(TAG, "Failed to allocate tensor arena in PSRAM, trying internal RAM...");
-        tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (tensor_arena == nullptr) {
-            ESP_LOGE(TAG, "Failed to allocate tensor arena!");
-            return ESP_ERR_NO_MEM;
-        }
+        ESP_LOGE(TAG, "Failed to allocate tensor arena!");
+        return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "Allocated %d bytes for tensor arena", kTensorArenaSize);
     

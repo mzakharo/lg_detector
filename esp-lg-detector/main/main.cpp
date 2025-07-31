@@ -13,7 +13,7 @@
 #include "esp_heap_caps.h" // For heap_caps_malloc
 
 // DEBUG MODE: 0=normal, 1=microphone test, 2=spectrogram debug, 3=sine wave test, 4=dump audio
-#define DEBUG_MODE 0
+#define DEBUG_MODE 3
 #include "test_vector.h"
 // TensorFlow Lite Micro
 #include "tensorflow/lite/micro/micro_interpreter.h"
@@ -532,6 +532,9 @@ void sine_wave_generator_task(void* arg) {
     const float sweep_duration_sec = 5.0f; // 5 second sweep cycle
     const float base_freq = 440.0f; // Start at 440 Hz (A4)
     const float max_freq = 1760.0f; // End at 1760 Hz (A6, 2 octaves higher)
+
+    // CORRECTED: Phase accumulator for proper chirp generation
+    static float phase = 0.0f;
     
     ESP_LOGI(TAG, "=== SINE WAVE GENERATOR STARTED ===");
     ESP_LOGI(TAG, "Generating frequency sweep: %.0f Hz to %.0f Hz over %.1f seconds", 
@@ -563,8 +566,14 @@ void sine_wave_generator_task(void* arg) {
                 
                 float current_freq = base_freq + (max_freq - base_freq) * freq_multiplier;
                 
-                // Generate sine wave sample
-                float sample_float = amplitude * sinf(2.0f * M_PI * current_freq * time_sec);
+                // Generate sine wave sample using the accumulated phase
+                float sample_float = amplitude * sinf(phase);
+
+                // Update phase for the next sample
+                phase += 2.0f * M_PI * current_freq / SAMPLE_RATE;
+                if (phase > 2.0f * M_PI) {
+                    phase -= 2.0f * M_PI;
+                }
                 
                 // Convert to 16-bit integer
                 audio_buffer[i] = (int16_t)(sample_float * 32767.0f);
@@ -790,6 +799,8 @@ void spectrogram_task(void* arg) {
                             // 1. Reorder the spectrogram from the circular buffer into the linear model_input_buffer
                             // This creates a coherent snapshot in time for normalization.
                             for (int col = 0; col < SPECTROGRAM_WIDTH; col++) {
+                                // FIXED: spectrogram_col_head points to the NEXT position to write
+                                // So the oldest column is at spectrogram_col_head, newest is at (spectrogram_col_head - 1)
                                 int src_col_idx = (spectrogram_col_head + col) % SPECTROGRAM_WIDTH;
                                 memcpy(&model_input_buffer[col * N_MELS], &spectrogram_buffer[src_col_idx * N_MELS], N_MELS * sizeof(float));
                             }
@@ -822,11 +833,11 @@ void spectrogram_task(void* arg) {
                             }
 #if 1
                             // --- DEBUG: Print the entire model input buffer for comparison ---
-                            // FIXED: Now correctly outputs in [frequency, time] format
+                            // CORRECTED: Output in [time, frequency] format to match actual memory layout
                             printf("--- C++ SPECTROGRAM START ---\\n");
-                            for (int mel = 0; mel < N_MELS; mel++) {
-                                for (int col = 0; col < SPECTROGRAM_WIDTH; col++) {
-                                    printf("%.4f,", model_input_buffer[mel * SPECTROGRAM_WIDTH + col]);
+                            for (int col = 0; col < SPECTROGRAM_WIDTH; col++) {
+                                for (int mel = 0; mel < N_MELS; mel++) {
+                                    printf("%.4f,", model_input_buffer[col * N_MELS + mel]);
                                 }
                                 printf("\\n");
                             }
