@@ -546,22 +546,41 @@ void i2s_reader_task(void* arg) {
     int16_t* i2s_read_buffer;
 
     while (true) {
+        // Check queue status before reading
+        UBaseType_t filled_queue_size = uxQueueMessagesWaiting(filled_audio_queue);
+        if (filled_queue_size > 1) {
+            ESP_LOGW(TAG, "Reader task: Pipeline is lagging! %d buffers waiting.", filled_queue_size);
+        }
+
         // Wait for an empty buffer from the queue
         if (xQueueReceive(empty_audio_queue, &i2s_read_buffer, portMAX_DELAY) == pdPASS) {
             size_t bytes_read = 0;
             esp_err_t err = i2s_channel_read(rx_chan, i2s_read_buffer, I2S_BUFFER_SIZE_BYTES, &bytes_read, portMAX_DELAY);
             if (err != ESP_OK) {
-                ESP_LOGE(TAG, "esp err %s", esp_err_to_name(err));
+                ESP_LOGE(TAG, "I2S read error: %s", esp_err_to_name(err));
+                 // Return buffer to the empty queue on error
+                xQueueSend(empty_audio_queue, &i2s_read_buffer, 0);
+                continue; // Skip to next loop iteration
             }
             
-            ESP_LOGI(TAG, "bytes read %d", bytes_read);
             if (bytes_read > 0) {
+                // Calculate RMS for power level
+                int64_t sum_squares = 0;
+                int samples_read = bytes_read / sizeof(int16_t);
+                for (int i = 0; i < samples_read; i++) {
+                    sum_squares += (int64_t)i2s_read_buffer[i] * i2s_read_buffer[i];
+                }
+                float rms = sqrtf((float)sum_squares / samples_read);
+                ESP_LOGI(TAG, "Mic Power (RMS): %.2f", rms);
+
                 // Send the filled buffer to the processing task
-                if (xQueueSend(filled_audio_queue, &i2s_read_buffer, portMAX_DELAY) != pdPASS) {
-                    ESP_LOGE(TAG, "Failed to send to filled audio queue");
+                if (xQueueSend(filled_audio_queue, &i2s_read_buffer, 0) != pdPASS) { // Use 0 timeout
+                    ESP_LOGE(TAG, "Filled audio queue is full! Dropping buffer.");
+                    // If sending fails, we must return the buffer to prevent a leak
+                    xQueueSend(empty_audio_queue, &i2s_read_buffer, 0);
                 }
             } else {
-                // If no bytes were read, return the buffer to the empty queue
+                // If no bytes were read, return the buffer to the empty queue immediately
                 xQueueSend(empty_audio_queue, &i2s_read_buffer, 0);
             }
         }
@@ -628,15 +647,22 @@ void spectrogram_task(void* arg) {
     ESP_LOGI(TAG, "N_MELS = %d, SPECTROGRAM_WIDTH = %d", N_MELS, SPECTROGRAM_WIDTH);
 
     // Calculate hop size for streaming (smaller hops for more responsive detection)
-    constexpr int STREAM_HOP_SAMPLES = N_FFT / 2; // 25% overlap, generates columns more frequently
+    constexpr int STREAM_HOP_SAMPLES = N_FFT; // 25% overlap, generates columns more frequently
     int samples_since_last_fft = 0;
 
     ESP_LOGI(TAG, "Starting streaming spectrogram generation (hop=%d samples)", STREAM_HOP_SAMPLES);
 
     // --- Main Processing Loop ---
+    int64_t last_inference_time_ms = 0;
     while (true) {
+        // Check queue status before processing
+        UBaseType_t empty_queue_size = uxQueueMessagesWaiting(empty_audio_queue);
+        if (empty_queue_size == 0) {
+            ESP_LOGW(TAG, "Spectrogram task: Starving for data! No empty buffers available.");
+        }
+
         // 1. Wait for audio data from the reader task
-        if (xQueueReceive(filled_audio_queue, &i2s_read_buffer, portMAX_DELAY) == pdPASS) {
+        if (xQueueReceive(filled_audio_queue, &i2s_read_buffer, pdMS_TO_TICKS(100)) == pdPASS) {
             int samples_read = I2S_BUFFER_SIZE_BYTES / sizeof(int16_t);
 
             // 2. Add new samples to the audio ring buffer
@@ -666,34 +692,6 @@ void spectrogram_task(void* arg) {
                     
                     generate_spectrogram_frame(audio_frame_buffer, current_column, fft_work_buffer);
 
-                    // NOTE: dB conversion will be done globally when we have a full spectrogram
-                    // This matches librosa.power_to_db(spectrogram, ref=np.max) behavior
-
-                    // DEBUG: Log spectrogram column statistics to verify it's updating
-                    static int debug_counter = 0;
-                    
-                    // Always log first 10 frames to debug the convergence issue
-                    if (debug_counter < 10) {
-                        float audio_min = audio_frame_buffer[0], audio_max = audio_frame_buffer[0];
-                        float audio_sum = 0.0f;
-                        for (int k = 0; k < N_FFT; k++) {
-                            if (audio_frame_buffer[k] < audio_min) audio_min = audio_frame_buffer[k];
-                            if (audio_frame_buffer[k] > audio_max) audio_max = audio_frame_buffer[k];
-                            audio_sum += audio_frame_buffer[k];
-                        }
-                        float audio_avg = audio_sum / N_FFT;
-                        
-                        //ESP_LOGI(TAG, "Frame %d - Extraction head: %d, Ring head: %d, Audio: min=%.4f, max=%.4f, avg=%.4f", 
-                        //         debug_counter, spectrogram_extraction_head, audio_ring_head, audio_min, audio_max, audio_avg);
-                        //ESP_LOGI(TAG, "Frame %d - First 5 audio samples: %.4f %.4f %.4f %.4f %.4f", 
-                        //         debug_counter, audio_frame_buffer[0], audio_frame_buffer[1], audio_frame_buffer[2], audio_frame_buffer[3], audio_frame_buffer[4]);
-                        //ESP_LOGI(TAG, "Frame %d - Mel dB: %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f",
-                        //         debug_counter, current_column[0], current_column[1], current_column[2], current_column[3], current_column[4],
-                        //         current_column[5], current_column[6], current_column[7], current_column[8], current_column[9]);
-                    }
-                    debug_counter++;
-
-
                     
                     // Update spectrogram buffer pointers
                     spectrogram_col_head = (spectrogram_col_head + 1) % SPECTROGRAM_WIDTH;
@@ -710,7 +708,9 @@ void spectrogram_task(void* arg) {
                         }
 
                         if (!is_in_cooldown) {
-                                                        
+                            int64_t current_time_ms = esp_timer_get_time() / 1000;
+                            if (current_time_ms - last_inference_time_ms > 500) {
+                                last_inference_time_ms = current_time_ms;
                             // 2. Find the global maximum power across the entire spectrogram
                             float global_max_power = 0.0f;
                             for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
@@ -781,6 +781,7 @@ void spectrogram_task(void* arg) {
                                 }
                             }
                             #endif
+                            }
                         }
                     }
                 }
@@ -912,29 +913,7 @@ void init_tflite() {
 // --- FIXED: generate_spectrogram_frame() function ---
 // REVISED to accept a work buffer, preventing stack overflow.
 void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectrogram, float* fft_work_buffer) {
-    // CRITICAL FIX: Completely clear the output and work buffers to prevent any accumulation
-    memset(out_mel_spectrogram, 0, N_MELS * sizeof(float));
-    memset(fft_work_buffer, 0, 2 * N_FFT * sizeof(float));
-    
-    // NEW: Remove DC offset and apply high-pass filtering
-    float dc_offset = 0.0f;
-    for (int i = 0; i < N_FFT; i++) {
-        dc_offset += audio_frame[i];
-    }
-    dc_offset /= N_FFT;
-    
-    // NEW: Apply simple high-pass filter (remove DC and very low frequencies)
-    // This is equivalent to a first-order high-pass filter with cutoff ~20Hz
-    static float filtered_frame[N_FFT];
-    float prev_sample = audio_frame[0] - dc_offset;
-    filtered_frame[0] = prev_sample;
-    
-    for (int i = 1; i < N_FFT; i++) {
-        float current_sample = audio_frame[i] - dc_offset;
-        // Simple high-pass: y[n] = x[n] - x[n-1] + 0.99*y[n-1]
-        filtered_frame[i] = current_sample;// - prev_sample + 0.99f * filtered_frame[i-1];
-        prev_sample = current_sample;
-    }
+   
     
     // 1. Apply Hann window to filtered audio frame and convert to complex format
     // dsps_fft2r_fc32 expects complex input (interleaved real/imaginary pairs)
@@ -989,12 +968,6 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
     local_power_spectrum[N_FFT / 2] = (nyquist_real * nyquist_real);
 
 
-    #if 0
-    // Add a small epsilon to avoid log(0)
-    for (int i = 0; i < FFT_BINS; i++) {
-        local_power_spectrum[i] += 1e-12;
-    }
-    #endif
  
     // 4. Apply Mel Filterbank with overflow protection
     for (int i = 0; i < N_MELS; i++) {
