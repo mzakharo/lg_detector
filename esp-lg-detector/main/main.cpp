@@ -12,7 +12,7 @@
 #include "driver/gpio.h" // For GPIO configuration
 #include "esp_heap_caps.h" // For heap_caps_malloc
 
-// DEBUG MODE: 0=normal, 1=microphone test, 2=spectrogram debug, 3=sine wave test
+// DEBUG MODE: 0=normal, 1=microphone test, 2=spectrogram debug, 3=sine wave test, 4=dump audio
 #define DEBUG_MODE 0
 #include "test_vector.h"
 // TensorFlow Lite Micro
@@ -303,6 +303,66 @@ void debug_microphone_task(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
+#elif DEBUG_MODE == 4
+// --- DEBUG: Audio Dump Task (Buffered) ---
+void debug_dump_audio_task(void* arg) {
+    ESP_LOGI(TAG, "=== AUDIO DUMP DEBUG MODE (BUFFERED) ===");
+    
+    constexpr int DUMP_DURATION_S = 1;
+    constexpr int DUMP_SAMPLES = SAMPLE_RATE * DUMP_DURATION_S;
+
+    // Allocate a large buffer in PSRAM (or internal RAM if PSRAM is not available)
+    int16_t* dump_buffer = (int16_t*)heap_caps_malloc(DUMP_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!dump_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate memory for audio dump buffer!");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "Allocated %d bytes for dump buffer.", DUMP_SAMPLES * sizeof(int16_t));
+
+    ESP_LOGI(TAG, "Recording %d seconds of audio...", DUMP_DURATION_S);
+
+    int16_t* i2s_read_buffer;
+    int samples_recorded = 0;
+
+    // --- Step 1: Record audio into the large buffer ---
+    while (samples_recorded < DUMP_SAMPLES) {
+        if (xQueueReceive(filled_audio_queue, &i2s_read_buffer, portMAX_DELAY) == pdPASS) {
+            int samples_to_copy = I2S_BUFFER_SIZE_BYTES / sizeof(int16_t);
+            // Prevent buffer overflow if the last chunk is smaller
+            if (samples_recorded + samples_to_copy > DUMP_SAMPLES) {
+                samples_to_copy = DUMP_SAMPLES - samples_recorded;
+            }
+            
+            memcpy(&dump_buffer[samples_recorded], i2s_read_buffer, samples_to_copy * sizeof(int16_t));
+            samples_recorded += samples_to_copy;
+
+            // Return the I2S buffer to the empty queue
+            xQueueSend(empty_audio_queue, &i2s_read_buffer, 0);
+        }
+    }
+
+    ESP_LOGI(TAG, "Recording complete. Now dumping %d samples...", samples_recorded);
+
+    // --- Step 2: Dump the entire buffer to the console ---
+    printf("--- START AUDIO DUMP ---\n");
+    for (int i = 0; i < samples_recorded-1; i++) {
+        printf("%d,", dump_buffer[i]);
+    }
+    printf("%d", dump_buffer[samples_recorded-1]);
+
+    printf("--- END AUDIO DUMP ---\n");
+
+    // --- Step 3: Clean up ---
+    free(dump_buffer);
+    ESP_LOGI(TAG, "Finished dumping audio.");
+    ESP_LOGI(TAG, "Set DEBUG_MODE back to 0 and recompile for normal operation.");
+
+    // Keep task alive but idle
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
 #elif DEBUG_MODE == 2
 // --- DEBUG: Spectrogram Pipeline Debug Task ---
 void debug_spectrogram_task(void* arg) {
@@ -549,7 +609,7 @@ void i2s_reader_task(void* arg) {
         // Check queue status before reading
         UBaseType_t filled_queue_size = uxQueueMessagesWaiting(filled_audio_queue);
         if (filled_queue_size > 1) {
-            ESP_LOGW(TAG, "Reader task: Pipeline is lagging! %d buffers waiting.", filled_queue_size);
+            //ESP_LOGW(TAG, "Reader task: Pipeline is lagging! %d buffers waiting.", filled_queue_size);
         }
 
         // Wait for an empty buffer from the queue
@@ -571,7 +631,7 @@ void i2s_reader_task(void* arg) {
                     sum_squares += (int64_t)i2s_read_buffer[i] * i2s_read_buffer[i];
                 }
                 float rms = sqrtf((float)sum_squares / samples_read);
-                ESP_LOGI(TAG, "Mic Power (RMS): %.2f", rms);
+                //ESP_LOGI(TAG, "Mic Power (RMS): %.2f", rms);
 
                 // Send the filled buffer to the processing task
                 if (xQueueSend(filled_audio_queue, &i2s_read_buffer, 0) != pdPASS) { // Use 0 timeout
@@ -589,6 +649,10 @@ void i2s_reader_task(void* arg) {
 #endif
 
 void spectrogram_task(void* arg) {
+    // --- Pre-emphasis Filter State ---
+    constexpr float PRE_EMPHASIS_ALPHA = 0.97f;
+    float previous_sample = 0.0f;
+
     // --- Streaming Spectrogram Buffers ---
     int16_t* i2s_read_buffer; // This will be a pointer received from the queue
     
@@ -647,7 +711,7 @@ void spectrogram_task(void* arg) {
     ESP_LOGI(TAG, "N_MELS = %d, SPECTROGRAM_WIDTH = %d", N_MELS, SPECTROGRAM_WIDTH);
 
     // Calculate hop size for streaming (smaller hops for more responsive detection)
-    constexpr int STREAM_HOP_SAMPLES = N_FFT; // 25% overlap, generates columns more frequently
+    constexpr int STREAM_HOP_SAMPLES = N_FFT;
     int samples_since_last_fft = 0;
 
     ESP_LOGI(TAG, "Starting streaming spectrogram generation (hop=%d samples)", STREAM_HOP_SAMPLES);
@@ -665,9 +729,20 @@ void spectrogram_task(void* arg) {
         if (xQueueReceive(filled_audio_queue, &i2s_read_buffer, pdMS_TO_TICKS(100)) == pdPASS) {
             int samples_read = I2S_BUFFER_SIZE_BYTES / sizeof(int16_t);
 
-            // 2. Add new samples to the audio ring buffer
+            // 2. Add new samples to the audio ring buffer (with pre-emphasis)
             for (int i = 0; i < samples_read; i++) {
-                audio_ring_buffer[audio_ring_head] = (float)i2s_read_buffer[i] / 32768.0f;
+                // Normalize the 16-bit sample to a float
+                float current_sample = (float)i2s_read_buffer[i] / 32768.0f;
+                
+                // Apply pre-emphasis filter to boost high frequencies
+                float filtered_sample = current_sample - PRE_EMPHASIS_ALPHA * previous_sample;
+                
+                // Store the filtered sample in the ring buffer
+                audio_ring_buffer[audio_ring_head] = filtered_sample;
+                
+                // Update the previous sample for the next iteration
+                previous_sample = current_sample;
+
                 audio_ring_head = (audio_ring_head + 1) % AUDIO_RING_SIZE;
                 
                 if (audio_ring_count < AUDIO_RING_SIZE) {
@@ -711,37 +786,41 @@ void spectrogram_task(void* arg) {
                             int64_t current_time_ms = esp_timer_get_time() / 1000;
                             if (current_time_ms - last_inference_time_ms > 500) {
                                 last_inference_time_ms = current_time_ms;
-                            // 2. Find the global maximum power across the entire spectrogram
-                            float global_max_power = 0.0f;
+                            // --- REVISED NORMALIZATION LOGIC ---
+                            // 1. Reorder the spectrogram from the circular buffer into the linear model_input_buffer
+                            // This creates a coherent snapshot in time for normalization.
+                            for (int col = 0; col < SPECTROGRAM_WIDTH; col++) {
+                                int src_col_idx = (spectrogram_col_head + col) % SPECTROGRAM_WIDTH;
+                                memcpy(&model_input_buffer[col * N_MELS], &spectrogram_buffer[src_col_idx * N_MELS], N_MELS * sizeof(float));
+                            }
+
+                            // 2. Find the maximum power value *within this coherent snapshot*
+                            float max_power_in_window = 0.0f;
                             for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
-                                if (spectrogram_buffer[i] > global_max_power) {
-                                    global_max_power = spectrogram_buffer[i];
+                                if (model_input_buffer[i] > max_power_in_window) {
+                                    max_power_in_window = model_input_buffer[i];
                                 }
                             }
-                            
+
                             // Prevent division by zero
-                            if (global_max_power <= 0.0f) {
-                                global_max_power = 1e-10f;
+                            if (max_power_in_window <= 0.0f) {
+                                max_power_in_window = 1e-10f;
                             }
-                            
-                            // 3. Convert entire spectrogram to dB using global maximum as reference
+
+                            // 3. Convert the snapshot to dB using its own maximum as the reference
                             const float amin = 1e-10f;
                             const float top_db = 80.0f;
-                            
                             for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
-                                float power_val = fmaxf(amin, spectrogram_buffer[i]);
+                                float power_val = fmaxf(amin, model_input_buffer[i]);
+                                float db_val = 10.0f * log10f(power_val / max_power_in_window);
                                 
-                                // Convert to dB: 10 * log10(S / global_max_power)
-                                float db_val = 10.0f * log10f(power_val / global_max_power);
-                                
-                                // Apply top_db clipping (standard in librosa)
+                                // Apply top_db clipping
                                 if (db_val < -top_db) {
                                     db_val = -top_db;
                                 }
-                                
                                 model_input_buffer[i] = db_val;
                             }
-#if 0
+#if 1
                             // --- DEBUG: Print the entire model input buffer for comparison ---
                             // FIXED: Now correctly outputs in [frequency, time] format
                             printf("--- C++ SPECTROGRAM START ---\\n");
@@ -842,6 +921,11 @@ extern "C" void app_main() {
     // Spectrogram debug mode
     xTaskCreatePinnedToCore(i2s_reader_task, "i2s_reader_task", 1024 * 4, NULL, 10, NULL, 0);
     xTaskCreatePinnedToCore(debug_spectrogram_task, "debug_spectrogram_task", 1024 * 6, NULL, 5, NULL, 1);
+#elif DEBUG_MODE == 4
+    // Audio dump debug mode
+    ESP_LOGI(TAG, "TFLite initialization skipped for audio dump");
+    xTaskCreatePinnedToCore(i2s_reader_task, "i2s_reader_task", 1024 * 4, NULL, 10, NULL, 0);
+    xTaskCreatePinnedToCore(debug_dump_audio_task, "debug_dump_audio_task", 1024 * 8, NULL, 5, NULL, 1); // Increased stack for malloc
 #elif DEBUG_MODE == 3
     // Sine wave debug mode
     init_tflite();
