@@ -14,7 +14,7 @@
 
 // DEBUG MODE: 0=normal, 1=microphone test, 2=spectrogram debug, 3=sine wave test
 #define DEBUG_MODE 0
-
+#include "test_vector.h"
 // TensorFlow Lite Micro
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -69,7 +69,7 @@ namespace {
     TfLiteTensor* input = nullptr;
     TfLiteTensor* output = nullptr;
 
-    constexpr int kTensorArenaSize = 2* 1024 * 1024;
+    constexpr int kTensorArenaSize = 100 * 1024;
     //uint8_t tensor_arena[kTensorArenaSize];
 
     // NEW: I2S channel handle for the new driver
@@ -710,23 +710,12 @@ void spectrogram_task(void* arg) {
                         }
 
                         if (!is_in_cooldown) {
-                            // CRITICAL FIX: Transpose spectrogram to [N_MELS, SPECTROGRAM_WIDTH] format
-                            // TensorFlow expects [frequency, time] layout, not [time, frequency]
-                            static float temp_spectrogram[N_MELS * SPECTROGRAM_WIDTH];
-                            
-                            // 1. First, copy and transpose the spectrogram buffer
-                            for (int mel = 0; mel < N_MELS; mel++) {
-                                for (int col = 0; col < SPECTROGRAM_WIDTH; col++) {
-                                    int src_col = (spectrogram_col_head + col) % SPECTROGRAM_WIDTH;
-                                    temp_spectrogram[mel * SPECTROGRAM_WIDTH + col] = spectrogram_buffer[src_col * N_MELS + mel];
-                                }
-                            }
-                            
+                                                        
                             // 2. Find the global maximum power across the entire spectrogram
                             float global_max_power = 0.0f;
                             for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
-                                if (temp_spectrogram[i] > global_max_power) {
-                                    global_max_power = temp_spectrogram[i];
+                                if (spectrogram_buffer[i] > global_max_power) {
+                                    global_max_power = spectrogram_buffer[i];
                                 }
                             }
                             
@@ -740,7 +729,7 @@ void spectrogram_task(void* arg) {
                             const float top_db = 80.0f;
                             
                             for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
-                                float power_val = fmaxf(amin, temp_spectrogram[i]);
+                                float power_val = fmaxf(amin, spectrogram_buffer[i]);
                                 
                                 // Convert to dB: 10 * log10(S / global_max_power)
                                 float db_val = 10.0f * log10f(power_val / global_max_power);
@@ -780,7 +769,7 @@ void spectrogram_task(void* arg) {
                                     confidence_score -= DECAY_RATE;
                                     if (confidence_score < 0.0f) confidence_score = 0.0f;
                                 }
-                                ESP_LOGI(TAG, "Melody Prob: %.2f | Confidence: %.2f", melody_prob, confidence_score);
+                                ESP_LOGI(TAG, " Other: %.5f, Melody Prob: %.5f | Confidence: %.2f", output->data.f[0], melody_prob, confidence_score);
 
                                 if (confidence_score >= CONFIDENCE_THRESHOLD) {
                                     ESP_LOGI(TAG, "*********************");
@@ -883,28 +872,27 @@ void init_tflite() {
     // The template parameter <N> is the number of ops you plan to add.
     static tflite::MicroMutableOpResolver<12> static_resolver;
     
-    // Add the specific operations your CNN uses.
-    // Your model uses Conv2D, ReLU (part of Conv and Dense), MaxPool2D, Flatten, and FullyConnected (Dense).
     static_resolver.AddConv2D();
     static_resolver.AddMaxPool2D();
-    static_resolver.AddFullyConnected(); // This is the 'Dense' layer
-    static_resolver.AddReshape();       // Flatten often requires Reshape
-    static_resolver.AddSoftmax();       // The final activation layer
-    // ReLU is usually fused with the preceding op, but we can add it if needed.
-    // The kernel for it is part of the fully_connected and conv kernels.
+    static_resolver.AddFullyConnected();
+    static_resolver.AddReshape();
+    static_resolver.AddSoftmax();
     static_resolver.AddQuantize();
     static_resolver.AddDequantize();
     static_resolver.AddShape();
     static_resolver.AddStridedSlice();
     static_resolver.AddPack();
     static_resolver.AddLogistic();
+    static_resolver.AddRelu();
 
-    uint8_t * tensor_arena = (uint8_t *) malloc(kTensorArenaSize);
-    if (tensor_arena == NULL)
-    {
-        ESP_LOGE(TAG, "TFLITE ARENA ERROR");
+       // Allocate tensor arena in PSRAM if available, otherwise internal RAM
+    uint8_t * tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (tensor_arena == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate tensor arena in PSRAM, trying internal RAM...");
         return;
     }
+    ESP_LOGI(TAG, "Allocated %d bytes for tensor arena", kTensorArenaSize);
+
 
     // 4. Build an interpreter to run the model
     static tflite::MicroInterpreter static_interpreter(
