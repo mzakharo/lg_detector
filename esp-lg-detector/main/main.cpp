@@ -42,7 +42,7 @@ constexpr int SAMPLE_RATE = 16000;
 constexpr float WINDOW_DURATION_S = 1.5f;
 constexpr float HOP_DURATION_S = 0.5f;
 constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
-constexpr int I2S_BUFFER_SIZE_BYTES = 3200;
+constexpr int I2S_BUFFER_SIZE_BYTES = 4096;
 
 // Spectrogram settings
 constexpr int N_FFT = 1024;
@@ -951,7 +951,7 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
     // 1. Apply Hann window to filtered audio frame and convert to complex format
     // dsps_fft2r_fc32 expects complex input (interleaved real/imaginary pairs)
     for (int i = 0; i < N_FFT; i++) {
-        fft_work_buffer[i * 2 + 0] = filtered_frame[i] * hann_window[i]; // Real part
+        fft_work_buffer[i * 2 + 0] = audio_frame[i] * hann_window[i]; // Real part
         fft_work_buffer[i * 2 + 1] = 0.0f;                            // Imaginary part (zero for real input)
     }
 
@@ -979,23 +979,26 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
     // Librosa's stft normalizes by the sum of the squared window.
     // For a Hann window, this sum is N_FFT * 3/8.
     // We apply this normalization to the power spectrum.
-    const float stft_normalization_factor = 1.0f / (float)(N_FFT * 3.0f / 8.0f);
+    //const float stft_normalization_factor = 1.0f / (float)(N_FFT * 3.0f / 8.0f);
 
     static float local_power_spectrum[FFT_BINS];
     
-    // DC component
-    local_power_spectrum[0] = fft_work_buffer[0] * fft_work_buffer[0];
+    // 3. Calculate Power Spectrum from FFT output
+    // This is |c|^2 for each complex bin c.
+    // The result is the power of the signal at each frequency bin.
+    // DC component (first bin)
+    local_power_spectrum[0] = fft_work_buffer[0] * fft_work_buffer[0]; // Real part only
     
-    // Positive frequencies
+    // Positive frequencies (up to Nyquist)
     for (int i = 1; i < N_FFT / 2; i++) {
         float real = fft_work_buffer[i * 2];
         float imag = fft_work_buffer[i * 2 + 1];
-        local_power_spectrum[i] = (real * real + imag * imag) * stft_normalization_factor;
+        local_power_spectrum[i] = (real * real + imag * imag);
     }
     
-    // Nyquist frequency
-    float nyquist_real = fft_work_buffer[N_FFT];
-    local_power_spectrum[N_FFT / 2] = (nyquist_real * nyquist_real) * stft_normalization_factor;
+    // Nyquist frequency (last bin)
+    float nyquist_real = fft_work_buffer[N_FFT]; // Real part only
+    local_power_spectrum[N_FFT / 2] = (nyquist_real * nyquist_real);
 
 
     #if 0
