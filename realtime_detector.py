@@ -5,6 +5,12 @@ import tensorflow as tf
 import paho.mqtt.client as mqtt
 import struct
 import argparse
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.colors import LinearSegmentedColormap
+from collections import deque
+import threading
+import time
 
 
 #import tflite_runtime.interpreter as tflite
@@ -101,13 +107,57 @@ def on_message(client, userdata, msg):
         
         # The model expects the spectrogram in a specific shape and type
         # Reshape for the model (add batch and channel dimensions)
-        spectrogram = spectrogram.astype(np.float32)[np.newaxis, ..., np.newaxis]
+        model_spectrogram = spectrogram.astype(np.float32)[np.newaxis, ..., np.newaxis]
         
-        spectrogram_queue.put(spectrogram)
+        spectrogram_queue.put((model_spectrogram, spectrogram))
 
     except Exception as e:
         print(f"Error processing MQTT message: {e}")
 
+
+class SpectrogramVisualizer:
+    def __init__(self, n_mels, spectrogram_width):
+        self.n_mels = n_mels
+        self.spectrogram_width = spectrogram_width
+        self.latest_spectrogram = np.zeros((self.n_mels, self.spectrogram_width))
+        self.data_lock = threading.Lock()
+
+        self.fig, self.ax = plt.subplots(figsize=(10, 4))
+        self.fig.suptitle('Real-time Spectrogram', fontsize=14)
+        
+        colors = ['#000033', '#000055', '#0000ff', '#0055ff', '#00ffff', '#55ff00', '#ffff00', '#ff5500', '#ff0000', '#ffffff']
+        cmap = LinearSegmentedColormap.from_list('spectrogram', colors, N=256)
+        
+        self.im = self.ax.imshow(self.latest_spectrogram, aspect='auto', origin='lower', cmap=cmap, vmin=-80, vmax=0, interpolation='nearest')
+        self.ax.set_xlabel('Time Frames')
+        self.ax.set_ylabel('Mel Frequency Bins')
+        self.ax.grid(True, alpha=0.3)
+        
+        cbar = plt.colorbar(self.im, ax=self.ax)
+        cbar.set_label('Power (dB)')
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    def update_spectrogram(self, new_spectrogram):
+        with self.data_lock:
+            self.latest_spectrogram = new_spectrogram
+
+    def update_plot(self, frame):
+        with self.data_lock:
+            self.im.set_array(self.latest_spectrogram)
+        return [self.im]
+
+    def draw(self):
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+
+    def start(self):
+        self.ani = animation.FuncAnimation(self.fig, self.update_plot, interval=100, blit=False)
+        #plt.ion()
+        plt.show(block=False)
+
+    def stop(self):
+        plt.close(self.fig)
 
 def main():
     global confidence_score, is_in_cooldown, last_trigger_time
@@ -117,6 +167,7 @@ def main():
                         help="Input source: 'mic' for microphone or 'mqtt' for MQTT.")
     parser.add_argument('--broker', type=str, default='nas.local', help='MQTT broker address.')
     parser.add_argument('--topic', type=str, default='lg-detector/spectrogram', help='MQTT topic for spectrograms.')
+    parser.add_argument('--visualize', action='store_true', help='Enable real-time spectrogram visualization.')
     args = parser.parse_args()
 
     CONFIG["input_source"] = args.input
@@ -156,34 +207,46 @@ def main():
         )
         stream.start()
 
+    visualizer = None
+    if args.visualize:
+        visualizer = SpectrogramVisualizer(CONFIG["n_mels"], CONFIG["max_spectrogram_width"])
+        visualizer.start()
+
     try:
         while True:
-            spectrogram = None
+            model_spectrogram = None
+            display_spectrogram = None
+
             if CONFIG["input_source"] == 'mic':
-                 # Get audio data from the queue (put there by the callback)
                 new_audio = audio_queue.get()
                 audio_buffer = np.append(audio_buffer, new_audio)
 
-                # Process the buffer only if we have enough data for a full window
                 while len(audio_buffer) >= window_samples:
-                    # 2. Preprocess a window of audio
                     window = audio_buffer[:window_samples]
-                    spectrogram = preprocess_window(window, CONFIG)                    
-                    # 6. Slide the buffer forward by the hop amount
+                    
+                    # Create spectrogram for model
+                    model_spectrogram = preprocess_window(window, CONFIG)
+                    
+                    # Create spectrogram for display (without batch/channel dims)
+                    if visualizer:
+                        display_spectrogram = np.squeeze(model_spectrogram)
+
                     audio_buffer = audio_buffer[hop_samples:]
+                    break # Process one window at a time
 
             else: # mqtt
-                spectrogram = spectrogram_queue.get()
+                model_spectrogram, display_spectrogram = spectrogram_queue.get()
 
+            if model_spectrogram is not None:
+                if visualizer and display_spectrogram is not None:
+                    visualizer.update_spectrogram(display_spectrogram)
+                    visualizer.draw()
 
-            if spectrogram is not None:
-                print(spectrogram.shape)
                 # 3. Run Inference
-                interpreter.set_tensor(input_details[0]['index'], spectrogram)
+                interpreter.set_tensor(input_details[0]['index'], model_spectrogram)
                 interpreter.invoke()
                 prediction = interpreter.get_tensor(output_details[0]['index'])[0]
                 
-                print('prediction', prediction)
                 # Assuming the 'lg_melody' class is the second one
                 melody_prob = prediction[1]
 
@@ -208,18 +271,17 @@ def main():
 
     except KeyboardInterrupt:
         print("\nStopping...")
-        if CONFIG["input_source"] == 'mqtt':
-            client.loop_stop()
-        elif 'stream' in locals() and stream:
-            stream.stop()
-            stream.close()
     except Exception as e:
         print(f"An error occurred: {e}")
-        if CONFIG["input_source"] == 'mqtt':
+    finally:
+        if visualizer:
+            visualizer.stop()
+        if CONFIG["input_source"] == 'mqtt' and 'client' in locals():
             client.loop_stop()
-        elif 'stream' in locals() and stream:
+        elif 'stream' in locals() and stream.active:
             stream.stop()
             stream.close()
+        print("Cleanup complete.")
 
 if __name__ == "__main__":
     main()

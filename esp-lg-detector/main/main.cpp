@@ -233,6 +233,18 @@ void init_mqtt() {
     ESP_LOGI(TAG, "MQTT client initialized and started");
 }
 
+// --- DC Removal Filter ---
+float remove_dc(float input) {
+    static const float alpha = 0.995f; // ~13Hz cutoff at 16kHz sample rate
+    static float prev_input = 0.0f;
+    static float prev_output = 0.0f;
+    
+    float output = input - prev_input + alpha * prev_output;
+    prev_input = input;
+    prev_output = output;
+    return output;
+}
+
 // --- FIXED: Spectrogram Generation and Detection Task ---
 void init_tflite();
 // REVISED SIGNATURE: Passes a work buffer to avoid stack overflow
@@ -433,6 +445,9 @@ void spectrogram_task(void* arg) {
             // 2. Process samples directly - accumulate until we have enough for FFT
             for (int i = 0; i < samples_read; i++) {
                 float current_sample = (float)received_data[i] / 32768.0f;
+                
+                // Apply DC removal filter
+                current_sample = remove_dc(current_sample);
                            
                 // Add sample to accumulator
                 audio_accumulator[audio_accumulator_count] = current_sample;
