@@ -84,7 +84,7 @@ namespace {
     TfLiteTensor* input = nullptr;
     TfLiteTensor* output = nullptr;
 
-    constexpr int kTensorArenaSize = 100 * 1024;
+    constexpr int kTensorArenaSize = 64 * 1024;
     //uint8_t tensor_arena[kTensorArenaSize];
 
     // NEW: I2S channel handle for the new driver
@@ -553,7 +553,7 @@ void spectrogram_task(void* arg) {
 
                             // --- Run Inference ---
                             memcpy(input->data.f, model_input_buffer, N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
-                            #if 0
+                            #if 1
                             if (interpreter->Invoke() != kTfLiteOk) {
                                 ESP_LOGE(TAG, "Invoke failed.");
                             } else {
@@ -682,8 +682,8 @@ void init_tflite() {
     static_resolver.AddRelu();
 
        // Allocate tensor arena in PSRAM if available, otherwise internal RAM
-    //uint8_t * tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    uint8_t * tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t * tensor_arena = (uint8_t*)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    //uint8_t * tensor_arena = (uint8_t*)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (tensor_arena == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate tensor arena in PSRAM, trying internal RAM...");
         return;
