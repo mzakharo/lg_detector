@@ -2,6 +2,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/ringbuf.h"
 #include "esp_log.h"
 #include "esp_dsp.h"
 #include "esp_timer.h"
@@ -94,13 +95,11 @@ namespace {
     bool is_in_cooldown = false;
     int64_t last_trigger_time_ms = 0;
 
-    // Inter-task communication
-    QueueHandle_t filled_audio_queue;
-    QueueHandle_t empty_audio_queue;
-
-    // Statically allocated audio buffers
-    constexpr int NUM_AUDIO_BUFFERS = 8;
-    int16_t* audio_buffers[NUM_AUDIO_BUFFERS];
+    // Inter-task communication - Ring buffer for audio streaming
+    RingbufHandle_t audio_ring_buffer;
+    
+    // Ring buffer configuration
+    constexpr int AUDIO_RING_BUFFER_SIZE = 8192; // 8KB ring buffer for audio data
 
     // Global Hann window buffer
     float hann_window[N_FFT];
@@ -242,7 +241,13 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
 #if DEBUG_MODE == 1
 // --- SINE WAVE GENERATOR TASK (replaces I2S reader for testing) ---
 void sine_wave_generator_task(void* arg) {
-    int16_t* audio_buffer;
+    // Allocate a local buffer for generating sine wave samples
+    int16_t* audio_buffer = (int16_t*)malloc(I2S_BUFFER_SIZE_BYTES);
+    if (!audio_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate audio buffer for sine wave generator");
+        vTaskDelete(NULL);
+        return;
+    }
     
     // Sine wave parameters for frequency sweep
     static uint32_t sample_counter = 0;
@@ -260,68 +265,65 @@ void sine_wave_generator_task(void* arg) {
     ESP_LOGI(TAG, "This will create a clear spectrogram pattern showing frequency progression");
     
     while (true) {
-        // Wait for an empty buffer from the queue
-        if (xQueueReceive(empty_audio_queue, &audio_buffer, portMAX_DELAY) == pdPASS) {
-            int samples_in_buffer = I2S_BUFFER_SIZE_BYTES / sizeof(int16_t);
+        int samples_in_buffer = I2S_BUFFER_SIZE_BYTES / sizeof(int16_t);
+        
+        // Generate sine wave samples
+        for (int i = 0; i < samples_in_buffer; i++) {
+            // Calculate time in seconds
+            float time_sec = (float)sample_counter / SAMPLE_RATE;
             
-            // Generate sine wave samples
-            for (int i = 0; i < samples_in_buffer; i++) {
-                // Calculate time in seconds
-                float time_sec = (float)sample_counter / SAMPLE_RATE;
-                
-                // Calculate current frequency using a triangular sweep pattern
-                float sweep_progress = fmodf(time_sec, sweep_duration_sec) / sweep_duration_sec;
-                
-                // Create a triangular wave for frequency (up then down)
-                float freq_multiplier;
-                if (sweep_progress < 0.5f) {
-                    // First half: sweep up
-                    freq_multiplier = sweep_progress * 2.0f;
-                } else {
-                    // Second half: sweep down
-                    freq_multiplier = 2.0f - (sweep_progress * 2.0f);
-                }
-                
-                float current_freq = base_freq + (max_freq - base_freq) * freq_multiplier;
-                
-                // Generate sine wave sample using the accumulated phase
-                float sample_float = amplitude * sinf(phase);
+            // Calculate current frequency using a triangular sweep pattern
+            float sweep_progress = fmodf(time_sec, sweep_duration_sec) / sweep_duration_sec;
+            
+            // Create a triangular wave for frequency (up then down)
+            float freq_multiplier;
+            if (sweep_progress < 0.5f) {
+                // First half: sweep up
+                freq_multiplier = sweep_progress * 2.0f;
+            } else {
+                // Second half: sweep down
+                freq_multiplier = 2.0f - (sweep_progress * 2.0f);
+            }
+            
+            float current_freq = base_freq + (max_freq - base_freq) * freq_multiplier;
+            
+            // Generate sine wave sample using the accumulated phase
+            float sample_float = amplitude * sinf(phase);
 
-                // Update phase for the next sample
-                phase += 2.0f * M_PI * current_freq / SAMPLE_RATE;
-                if (phase > 2.0f * M_PI) {
-                    phase -= 2.0f * M_PI;
-                }
-                
-                // Convert to 16-bit integer
-                audio_buffer[i] = (int16_t)(sample_float * 32767.0f);
-                
-                sample_counter++;
+            // Update phase for the next sample
+            phase += 2.0f * M_PI * current_freq / SAMPLE_RATE;
+            if (phase > 2.0f * M_PI) {
+                phase -= 2.0f * M_PI;
             }
             
-            // Log frequency every second for verification
-            static uint32_t last_log_time = 0;
-            uint32_t current_time_sec = sample_counter / SAMPLE_RATE;
-            if (current_time_sec != last_log_time) {
-                float time_sec = (float)sample_counter / SAMPLE_RATE;
-                float sweep_progress = fmodf(time_sec, sweep_duration_sec) / sweep_duration_sec;
-                float freq_multiplier;
-                if (sweep_progress < 0.5f) {
-                    freq_multiplier = sweep_progress * 2.0f;
-                } else {
-                    freq_multiplier = 2.0f - (sweep_progress * 2.0f);
-                }
-                float current_freq = base_freq + (max_freq - base_freq) * freq_multiplier;
-                
-                ESP_LOGI(TAG, "Time: %lus, Frequency: %.0f Hz, Sweep progress: %.1f%%", 
-                         current_time_sec, current_freq, sweep_progress * 100.0f);
-                last_log_time = current_time_sec;
-            }
+            // Convert to 16-bit integer
+            audio_buffer[i] = (int16_t)(sample_float * 32767.0f);
             
-            // Send the filled buffer to the processing task
-            if (xQueueSend(filled_audio_queue, &audio_buffer, portMAX_DELAY) != pdPASS) {
-                ESP_LOGE(TAG, "Failed to send to filled audio queue");
+            sample_counter++;
+        }
+        
+        // Log frequency every second for verification
+        static uint32_t last_log_time = 0;
+        uint32_t current_time_sec = sample_counter / SAMPLE_RATE;
+        if (current_time_sec != last_log_time) {
+            float time_sec = (float)sample_counter / SAMPLE_RATE;
+            float sweep_progress = fmodf(time_sec, sweep_duration_sec) / sweep_duration_sec;
+            float freq_multiplier;
+            if (sweep_progress < 0.5f) {
+                freq_multiplier = sweep_progress * 2.0f;
+            } else {
+                freq_multiplier = 2.0f - (sweep_progress * 2.0f);
             }
+            float current_freq = base_freq + (max_freq - base_freq) * freq_multiplier;
+            
+            ESP_LOGI(TAG, "Time: %lus, Frequency: %.0f Hz, Sweep progress: %.1f%%", 
+                     current_time_sec, current_freq, sweep_progress * 100.0f);
+            last_log_time = current_time_sec;
+        }
+        
+        // Send the audio data to the ring buffer
+        if (xRingbufferSend(audio_ring_buffer, audio_buffer, I2S_BUFFER_SIZE_BYTES, portMAX_DELAY) != pdTRUE) {
+            ESP_LOGE(TAG, "Failed to send audio data to ring buffer");
         }
         
         // Small delay to simulate I2S timing (not critical for testing)
@@ -330,78 +332,67 @@ void sine_wave_generator_task(void* arg) {
 }
 #else
 void i2s_reader_task(void* arg) {
-    int16_t* i2s_read_buffer;
+    // Allocate a local buffer for reading I2S data
+    int16_t* i2s_read_buffer = (int16_t*)malloc(I2S_BUFFER_SIZE_BYTES);
+    if (!i2s_read_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate I2S read buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "I2S reader task started with ring buffer");
 
     while (true) {
-        // Check queue status before reading
-        UBaseType_t filled_queue_size = uxQueueMessagesWaiting(filled_audio_queue);
-        if (filled_queue_size > NUM_AUDIO_BUFFERS - 1) {
-            ESP_LOGW(TAG, "Reader task: Pipeline is lagging! %d buffers waiting.", filled_queue_size);
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_channel_read(rx_chan, i2s_read_buffer, I2S_BUFFER_SIZE_BYTES, &bytes_read, portMAX_DELAY);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "I2S read error: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(10)); // Brief delay before retry
+            continue;
         }
 
-        // Wait for an empty buffer from the queue
-        if (xQueueReceive(empty_audio_queue, &i2s_read_buffer, portMAX_DELAY) == pdPASS) {
-            size_t bytes_read = 0;
-            esp_err_t err = i2s_channel_read(rx_chan, i2s_read_buffer, I2S_BUFFER_SIZE_BYTES, &bytes_read, portMAX_DELAY);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "I2S read error: %s", esp_err_to_name(err));
-                 // Return buffer to the empty queue on error
-                xQueueSend(empty_audio_queue, &i2s_read_buffer, 0);
-                continue; // Skip to next loop iteration
+        if (bytes_read == I2S_BUFFER_SIZE_BYTES) {            
+            // Send the audio data directly to the ring buffer
+            if (xRingbufferSend(audio_ring_buffer, i2s_read_buffer, I2S_BUFFER_SIZE_BYTES, pdMS_TO_TICKS(100)) != pdTRUE) {
+                ESP_LOGW(TAG, "Ring buffer full! Dropping audio data.");
+                // Continue reading to prevent I2S buffer overflow
             }
-
-            ESP_LOGI(TAG, "%d %d %d %d", i2s_read_buffer[0], i2s_read_buffer[1],i2s_read_buffer[2],i2s_read_buffer[3]);
-            
-            if (bytes_read == I2S_BUFFER_SIZE_BYTES) {
-                // Send the filled buffer to the processing task
-                if (xQueueSend(filled_audio_queue, &i2s_read_buffer, 0) != pdPASS) { // Use 0 timeout
-                    ESP_LOGE(TAG, "Filled audio queue is full! Dropping buffer.");
-                    // If sending fails, we must return the buffer to prevent a leak
-                    xQueueSend(empty_audio_queue, &i2s_read_buffer, 0);
-                }
-            } else {
-                // If no bytes were read, return the buffer to the empty queue immediately
-                xQueueSend(empty_audio_queue, &i2s_read_buffer, 0);
-            }
+        } else {
+            ESP_LOGW(TAG, "Incomplete I2S read: %d bytes (expected %d)", bytes_read, I2S_BUFFER_SIZE_BYTES);
         }
+        
+        // Small delay to prevent overwhelming the ring buffer
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 #endif
 
 void spectrogram_task(void* arg) {
-
-    // --- Streaming Spectrogram Buffers ---
-    int16_t* i2s_read_buffer; // This will be a pointer received from the queue
+    // --- Simplified Spectrogram Buffers ---
+    // Simple audio buffer to accumulate samples for FFT processing
+    float* audio_accumulator = (float*)malloc(N_FFT * sizeof(float));
+    int audio_accumulator_count = 0;
     
-    // Audio ring buffer for FFT frames - increased size to prevent overwrites
-    constexpr int AUDIO_RING_SIZE = N_FFT * 8; // Much larger buffer to handle timing mismatches
-    float* audio_ring_buffer = (float*)malloc(AUDIO_RING_SIZE * sizeof(float));
-    int audio_ring_head = 0;
-    int audio_ring_count = 0;
-    
-     // Spectrogram column buffer (circular buffer of columns)
+    // Spectrogram column buffer (circular buffer of columns)
     float* spectrogram_buffer = (float*)malloc(N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
     int spectrogram_col_head = 0;
     int spectrogram_col_count = 0;
     
     // CRITICAL FIX: Allocate the FFT work buffer in internal RAM for the DSP library.
     // ESP-DSP real FFT requires N_FFT buffer size for real input.
-    float* fft_work_buffer = (float*)heap_caps_malloc(N_FFT * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    
-    // STACK OVERFLOW FIX: Allocate audio frame buffer on heap instead of stack
-    float* audio_frame_buffer = (float*)malloc(N_FFT * sizeof(float));
+    float* fft_work_buffer = (float*)heap_caps_aligned_alloc(16, N_FFT * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
     // STACK OVERFLOW FIX: Allocate model input buffer on heap instead of stack
     float* model_input_buffer = (float*)malloc(N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
 
-    if (!audio_ring_buffer || !spectrogram_buffer || !fft_work_buffer || !audio_frame_buffer || !model_input_buffer) {
+    if (!audio_accumulator || !spectrogram_buffer || !fft_work_buffer || !model_input_buffer) {
         ESP_LOGE(TAG, "Failed to allocate one or more buffers!");
         vTaskDelete(NULL);
         return;
     }
 
     // Initialize buffers
-    memset(audio_ring_buffer, 0, AUDIO_RING_SIZE * sizeof(float));
+    memset(audio_accumulator, 0, N_FFT * sizeof(float));
     memset(spectrogram_buffer, 0, N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
 
     // --- TFLite Model Sanity Check ---
@@ -432,48 +423,33 @@ void spectrogram_task(void* arg) {
     // --- Main Processing Loop ---
     int64_t last_inference_time_ms = 0;
     while (true) {
-        // Check queue status before processing
-        UBaseType_t empty_queue_size = uxQueueMessagesWaiting(empty_audio_queue);
-        if (empty_queue_size == 0) {
-            ESP_LOGW(TAG, "Spectrogram task: Starving for data! No empty buffers available.");
-        }
+        // 1. Receive audio data from the ring buffer
+        size_t item_size = 0;
+        int16_t* received_data = (int16_t*)xRingbufferReceive(audio_ring_buffer, &item_size, pdMS_TO_TICKS(100));
+        
+        if (received_data != NULL) {
+            int samples_read = item_size / sizeof(int16_t);
 
-        // 1. Wait for audio data from the reader task
-        if (xQueueReceive(filled_audio_queue, &i2s_read_buffer, pdMS_TO_TICKS(100)) == pdPASS) {
-            int samples_read = I2S_BUFFER_SIZE_BYTES / sizeof(int16_t);
-
-            // 2. Add new samples to the audio ring buffer (with DC removal and pre-emphasis)
+            // 2. Process samples directly - accumulate until we have enough for FFT
             for (int i = 0; i < samples_read; i++) {
-
-                float current_sample = (float)i2s_read_buffer[i] / 32768.0f;
-                audio_ring_buffer[audio_ring_head] = current_sample;
-
-                if (i < 4){
-                    ESP_LOGI(TAG, "sample %d", i2s_read_buffer[i]);
-                }
-                audio_ring_head = (audio_ring_head + 1) % AUDIO_RING_SIZE;
-                
-                if (audio_ring_count < AUDIO_RING_SIZE) {
-                    audio_ring_count++;
-                }
-                
+                float current_sample = (float)received_data[i] / 32768.0f;
+                           
+                // Add sample to accumulator
+                audio_accumulator[audio_accumulator_count] = current_sample;
+                audio_accumulator_count++;
                 samples_since_last_fft++;
 
-                // 3. Check if we should generate a new spectrogram column
-                if (audio_ring_count >= N_FFT && samples_since_last_fft >= STREAM_HOP_SAMPLES) {
+                // 3. Check if we have enough samples for FFT processing
+                if (audio_accumulator_count >= N_FFT && samples_since_last_fft >= STREAM_HOP_SAMPLES) {
                     samples_since_last_fft = 0;
 
-                    // Extract a window of the most recent audio samples.
-                    // This creates a scrolling spectrogram.
-                    int start_idx = (audio_ring_head - N_FFT + AUDIO_RING_SIZE) % AUDIO_RING_SIZE;
-                    for (int j = 0; j < N_FFT; j++) {
-                        audio_frame_buffer[j] = audio_ring_buffer[(start_idx + j) % AUDIO_RING_SIZE];
-                    }
-
-                    // Generate one spectrogram column (keep as power values for now)
+                    // Generate one spectrogram column directly from accumulator
                     float* current_column = &spectrogram_buffer[spectrogram_col_head * N_MELS];
+                    generate_spectrogram_frame(audio_accumulator, current_column, fft_work_buffer);
                     
-                    generate_spectrogram_frame(audio_frame_buffer, current_column, fft_work_buffer);
+                    // Shift accumulator by hop size (overlap processing)
+                    memmove(audio_accumulator, &audio_accumulator[STREAM_HOP_SAMPLES], (N_FFT - STREAM_HOP_SAMPLES) * sizeof(float));
+                    audio_accumulator_count = N_FFT - STREAM_HOP_SAMPLES;
 
                     
                     // Update spectrogram buffer pointers
@@ -562,7 +538,7 @@ void spectrogram_task(void* arg) {
 
                             // --- Run Inference ---
                             memcpy(input->data.f, model_input_buffer, N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
-                            #if 1
+                            #if 0
                             if (interpreter->Invoke() != kTfLiteOk) {
                                 ESP_LOGE(TAG, "Invoke failed.");
                             } else {
@@ -593,8 +569,9 @@ void spectrogram_task(void* arg) {
                     }
                 }
             }
-            // Return the processed buffer to the empty queue
-            xQueueSend(empty_audio_queue, &i2s_read_buffer, 0);
+            
+            // Return the item to the ring buffer
+            vRingbufferReturnItem(audio_ring_buffer, (void*)received_data);
         }
     }
 }
@@ -602,12 +579,12 @@ void spectrogram_task(void* arg) {
 
 extern "C" void app_main() {
     ESP_LOGI(TAG, "Initializing FFT tables for N_FFT=%d...", N_FFT);
-    esp_err_t ret = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+    esp_err_t ret = dsps_fft2r_init_fc32(NULL, N_FFT/2); //CONFIG_DSP_MAX_FFT_SIZE
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "FFT init failed: %s", esp_err_to_name(ret));
         return;
     }
-    ret = dsps_fft4r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+    ret = dsps_fft4r_init_fc32(NULL, N_FFT/2);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "FFT4R init failed: %s", esp_err_to_name(ret));
         return;
@@ -630,19 +607,13 @@ extern "C" void app_main() {
     ESP_LOGI(TAG, "=== SINE WAVE DEBUG MODE ENABLED ===");
 #endif
 
-    // Create the audio queues
-    filled_audio_queue = xQueueCreate(NUM_AUDIO_BUFFERS, sizeof(int16_t*));
-    empty_audio_queue = xQueueCreate(NUM_AUDIO_BUFFERS, sizeof(int16_t*));
-
-    // Allocate and populate the empty audio queue
-    for (int i = 0; i < NUM_AUDIO_BUFFERS; i++) {
-        audio_buffers[i] = (int16_t*) heap_caps_malloc(I2S_BUFFER_SIZE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (!audio_buffers[i]) {
-            ESP_LOGE(TAG, "Failed to allocate audio buffer %d", i);
-            return;
-        }
-        xQueueSend(empty_audio_queue, &audio_buffers[i], 0);
+    // Create the audio ring buffer
+    audio_ring_buffer = xRingbufferCreate(AUDIO_RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
+    if (audio_ring_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to create audio ring buffer");
+        return;
     }
+    ESP_LOGI(TAG, "Audio ring buffer created successfully (%d bytes)", AUDIO_RING_BUFFER_SIZE);
 
 
     // Initialize WiFi and MQTT
@@ -739,8 +710,7 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
     
     // 5. Calculate Power Spectrum from the real FFT output
     static float local_power_spectrum[FFT_BINS];
-    memset(local_power_spectrum, 0, sizeof(local_power_spectrum));
-    
+
     // The output of dsps_cplx2real_fc32 is a packed spectrum.
     // DC component is in fft_work_buffer[0]
     // Nyquist component is in fft_work_buffer[1]
