@@ -22,6 +22,9 @@
 // DEBUG MODE: 0=normal, 1=sine wave test
 #define DEBUG_MODE 0
 
+//Output spectogram over MQTT
+//#define SPECTOGRAM_DEBUG
+
 // TensorFlow Lite Micro
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -93,14 +96,12 @@ namespace {
 
     // Confidence state (same as before)
     float confidence_score = 0.0f;
-    bool is_in_cooldown = false;
-    int64_t last_trigger_time_ms = 0;
 
     // Inter-task communication - Ring buffer for audio streaming
     RingbufHandle_t audio_ring_buffer;
     
     // Ring buffer configuration
-    constexpr int AUDIO_RING_BUFFER_SIZE = 8192*2; // 16KB ring buffer for audio data
+    constexpr int AUDIO_RING_BUFFER_SIZE = 16384; // 16KB ring buffer for audio data
 
     // Global Hann window buffer
     float hann_window[N_FFT];
@@ -398,13 +399,11 @@ void spectrogram_task(void* arg) {
     int spectrogram_col_head = 0;
     int spectrogram_col_count = 0;
 
-
     if (!spectrogram_buffer) {
         ESP_LOGE(TAG, "Failed to allocate spectrogram_buffer");
         vTaskDelete(NULL);
         return;
     }
-
     
     // CRITICAL FIX: Allocate the FFT work buffer in internal RAM for the DSP library.
     // ESP-DSP real FFT requires N_FFT buffer size for real input.
@@ -415,16 +414,7 @@ void spectrogram_task(void* arg) {
         vTaskDelete(NULL);
         return;
     }
-
-    // STACK OVERFLOW FIX: Allocate model input buffer on heap instead of stack
-    static float model_input_buffer[N_MELS*SPECTROGRAM_WIDTH]; //= (float*)heap_caps_malloc(N_MELS * SPECTROGRAM_WIDTH * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#if 0
-    if (!model_input_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate model_input_buffer!");
-        vTaskDelete(NULL);
-        return;
-    }
-#endif
+    static float model_input_buffer[N_MELS*SPECTROGRAM_WIDTH];
 
     // 5. Calculate Power Spectrum from the real FFT output
     float * local_power_spectrum = (float*)heap_caps_malloc(FFT_BINS* sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -465,7 +455,6 @@ void spectrogram_task(void* arg) {
     ESP_LOGI(TAG, "Starting streaming spectrogram generation (hop=%d samples)", STREAM_HOP_SAMPLES);
 
     // --- Main Processing Loop ---
-    int64_t last_inference_time_ms = 0;
     while (true) {
         // 1. Receive audio data from the ring buffer
         size_t item_size = 0;
@@ -497,7 +486,6 @@ void spectrogram_task(void* arg) {
                     // Shift accumulator by hop size (overlap processing)
                     memmove(audio_accumulator, &audio_accumulator[STREAM_HOP_SAMPLES], (N_FFT - STREAM_HOP_SAMPLES) * sizeof(float));
                     audio_accumulator_count = N_FFT - STREAM_HOP_SAMPLES;
-
                     
                     // Update spectrogram buffer pointers
                     spectrogram_col_head = (spectrogram_col_head + 1) % SPECTROGRAM_WIDTH;
@@ -507,137 +495,121 @@ void spectrogram_task(void* arg) {
 
                     // 4. Run inference when we have a full spectrogram
                     if (spectrogram_col_count == SPECTROGRAM_WIDTH) {
-                        spectrogram_col_count -= SPECTROGRAM_WIDTH/4;
-                        // --- Cooldown Logic ---
-                        if (is_in_cooldown && (esp_timer_get_time() / 1000 - last_trigger_time_ms > COOLDOWN_SECONDS * 1000)) {
-                            is_in_cooldown = false;
-                            ESP_LOGI(TAG, "Cooldown finished. Resuming detection.");
+
+                        spectrogram_col_count -= SPECTROGRAM_WIDTH/4; //slide spectogram
+
+                        // --- REVISED NORMALIZATION LOGIC ---
+                        // 1. Reorder and TRANSPOSE the spectrogram from the circular buffer into the linear model_input_buffer
+                        // The model expects a [MELS, WIDTH] layout, but our buffer is stored as columns [WIDTH, MELS].
+                        for (int col = 0; col < SPECTROGRAM_WIDTH; ++col) {
+                            int src_col_idx = (spectrogram_col_head + col) % SPECTROGRAM_WIDTH;
+                            for (int mel = 0; mel < N_MELS; ++mel) {
+                                // Transpose operation:
+                                // Destination[mel, col] = Source[col, mel]
+                                model_input_buffer[mel * SPECTROGRAM_WIDTH + col] = spectrogram_buffer[src_col_idx * N_MELS + mel];
+                            }
                         }
 
-                        if (!is_in_cooldown) {
-                            int64_t current_time_ms = esp_timer_get_time() / 1000;
-                            if (current_time_ms - last_inference_time_ms > 500) {
-                                last_inference_time_ms = current_time_ms;
-                            // --- REVISED NORMALIZATION LOGIC ---
-                            // 1. Reorder and TRANSPOSE the spectrogram from the circular buffer into the linear model_input_buffer
-                            // The model expects a [MELS, WIDTH] layout, but our buffer is stored as columns [WIDTH, MELS].
-                            for (int col = 0; col < SPECTROGRAM_WIDTH; ++col) {
-                                int src_col_idx = (spectrogram_col_head + col) % SPECTROGRAM_WIDTH;
-                                for (int mel = 0; mel < N_MELS; ++mel) {
-                                    // Transpose operation:
-                                    // Destination[mel, col] = Source[col, mel]
-                                    model_input_buffer[mel * SPECTROGRAM_WIDTH + col] = spectrogram_buffer[src_col_idx * N_MELS + mel];
-                                }
+                        // 2. Find the maximum power value *within this coherent snapshot*
+                        float max_power_in_window = 0.0f;
+                        for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
+                            if (model_input_buffer[i] > max_power_in_window) {
+                                max_power_in_window = model_input_buffer[i];
                             }
+                        }
 
-                            // 2. Find the maximum power value *within this coherent snapshot*
-                            float max_power_in_window = 0.0f;
-                            for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
-                                if (model_input_buffer[i] > max_power_in_window) {
-                                    max_power_in_window = model_input_buffer[i];
-                                }
-                            }
+                        // Prevent division by zero
+                        if (max_power_in_window <= 0.0f) {
+                            max_power_in_window = 1e-10f;
+                        }
 
-                            // Prevent division by zero
-                            if (max_power_in_window <= 0.0f) {
-                                max_power_in_window = 1e-10f;
+                        // 3. Convert the snapshot to dB using its own maximum as the reference
+                        const float amin = 1e-10f;
+                        const float top_db = 80.0f;
+                        for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
+                            float power_val = fmaxf(amin, model_input_buffer[i]);
+                            float db_val = 10.0f * log10f(power_val / max_power_in_window);
+                            
+                            // Apply top_db clipping
+                            if (db_val < -top_db) {
+                                db_val = -top_db;
                             }
-
-                            // 3. Convert the snapshot to dB using its own maximum as the reference
-                            const float amin = 1e-10f;
-                            const float top_db = 80.0f;
-                            for (int i = 0; i < N_MELS * SPECTROGRAM_WIDTH; i++) {
-                                float power_val = fmaxf(amin, model_input_buffer[i]);
-                                float db_val = 10.0f * log10f(power_val / max_power_in_window);
-                                
-                                // Apply top_db clipping
-                                if (db_val < -top_db) {
-                                    db_val = -top_db;
-                                }
-                                model_input_buffer[i] = db_val;
-                            }
+                            model_input_buffer[i] = db_val;
+                        }
 #if 0
-                            // --- DEBUG: Print the entire model input buffer for comparison ---
-                            // CORRECTED: Output in [time, frequency] format to match actual memory layout
-                            printf("--- C++ SPECTROGRAM START ---\\n");
-                            for (int col = 0; col < SPECTROGRAM_WIDTH; col++) {
-                                for (int mel = 0; mel < N_MELS; mel++) {
-                                    printf("%.4f,", model_input_buffer[col * N_MELS + mel]);
-                                }
-                                printf("\\n");
+                        // --- DEBUG: Print the entire model input buffer for comparison ---
+                        // CORRECTED: Output in [time, frequency] format to match actual memory layout
+                        printf("--- C++ SPECTROGRAM START ---\\n");
+                        for (int col = 0; col < SPECTROGRAM_WIDTH; col++) {
+                            for (int mel = 0; mel < N_MELS; mel++) {
+                                printf("%.4f,", model_input_buffer[col * N_MELS + mel]);
                             }
-                            printf("--- C++ SPECTROGRAM END ---\\n");
+                            printf("\\n");
+                        }
+                        printf("--- C++ SPECTROGRAM END ---\\n");
 #endif
 
-#if 0
-                            // --- MQTT Streaming: Publish spectrogram data before inference ---
+#ifdef SPECTOGRAM_DEBUG
+                        // --- MQTT Streaming: Publish spectrogram data before inference ---
+                        if (mqtt_connected && mqtt_client != nullptr) {
+                            int msg_id = esp_mqtt_client_publish(mqtt_client, 
+                                                                MQTT_TOPIC, 
+                                                                (char*)model_input_buffer, 
+                                                                N_MELS * SPECTROGRAM_WIDTH * sizeof(float), 
+                                                                0, 0);
+                            if (msg_id == -1) {
+                                ESP_LOGW(TAG, "Failed to publish spectrogram data to MQTT");
+                            } else {
+                                ESP_LOGI(TAG, "Published spectrogram data (%d bytes) to MQTT, msg_id=%d", 
+                                            N_MELS * SPECTROGRAM_WIDTH * sizeof(float), msg_id);
+                            }
+                        } else {
+                            ESP_LOGW(TAG, "MQTT not connected, skipping spectrogram publish");
+                        }
+#endif
+                        // --- Run Inference ---
+                        memcpy(input->data.f, model_input_buffer, N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
+                        if (interpreter->Invoke() != kTfLiteOk) {
+                            ESP_LOGE(TAG, "Invoke failed.");
+                        } else {
+                            float melody_prob = output->data.f[1];
+
+                            // --- Confidence Accumulator Logic ---
+                            if (melody_prob > PREDICTION_THRESHOLD) {
+                                confidence_score += INCREMENT_AMOUNT;
+                                if (confidence_score > 1.0f) confidence_score = 1.0f;
+                            } else {
+                                confidence_score -= DECAY_RATE;
+                                if (confidence_score < 0.0f) confidence_score = 0.0f;
+                            }
+                            ESP_LOGI(TAG, " Other: %.5f, Melody Prob: %.5f | Confidence: %.2f", output->data.f[0], melody_prob, confidence_score);
+
+                            // --- Publish detection results as JSON to MQTT ---
                             if (mqtt_connected && mqtt_client != nullptr) {
-                                int msg_id = esp_mqtt_client_publish(mqtt_client, 
-                                                                   MQTT_TOPIC, 
-                                                                   (char*)model_input_buffer, 
-                                                                   N_MELS * SPECTROGRAM_WIDTH * sizeof(float), 
-                                                                   0, 0);
-                                if (msg_id == -1) {
-                                    ESP_LOGW(TAG, "Failed to publish spectrogram data to MQTT");
-                                } else {
-                                    ESP_LOGI(TAG, "Published spectrogram data (%d bytes) to MQTT, msg_id=%d", 
-                                             N_MELS * SPECTROGRAM_WIDTH * sizeof(float), msg_id);
-                                }
-                            } else {
-                                ESP_LOGW(TAG, "MQTT not connected, skipping spectrogram publish");
-                            }
-#endif
-                            // --- Run Inference ---
-                            memcpy(input->data.f, model_input_buffer, N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
-                            #if 1
-                            if (interpreter->Invoke() != kTfLiteOk) {
-                                ESP_LOGE(TAG, "Invoke failed.");
-                            } else {
-                                float melody_prob = output->data.f[1];
-
-                                // --- Confidence Accumulator Logic ---
-                                if (melody_prob > PREDICTION_THRESHOLD) {
-                                    confidence_score += INCREMENT_AMOUNT;
-                                    if (confidence_score > 1.0f) confidence_score = 1.0f;
-                                } else {
-                                    confidence_score -= DECAY_RATE;
-                                    if (confidence_score < 0.0f) confidence_score = 0.0f;
-                                }
-                                ESP_LOGI(TAG, " Other: %.5f, Melody Prob: %.5f | Confidence: %.2f", output->data.f[0], melody_prob, confidence_score);
-
-                                // --- Publish detection results as JSON to MQTT ---
-                                if (mqtt_connected && mqtt_client != nullptr) {
-                                    char json_buffer[128];
-                                    int json_len = snprintf(json_buffer, sizeof(json_buffer), 
-                                                          "{\"melody_prob\": %.5f, \"confidence_score\": %d}", 
-                                                          melody_prob, (int)(confidence_score * 100));
-                                    
-                                    if (json_len > 0 && json_len < sizeof(json_buffer)) {
-                                        int msg_id = esp_mqtt_client_publish(mqtt_client, 
-                                                                           MQTT_DETECTION_TOPIC, 
-                                                                           json_buffer, 
-                                                                           json_len, 
-                                                                           0, 0);
-                                        if (msg_id == -1) {
-                                            ESP_LOGW(TAG, "Failed to publish detection JSON to MQTT");
-                                        }
-                                    } else {
-                                        ESP_LOGW(TAG, "JSON buffer overflow or formatting error");
+                                char json_buffer[128];
+                                int json_len = snprintf(json_buffer, sizeof(json_buffer), 
+                                                        "{\"melody_prob\": %.5f, \"confidence_score\": %d}", 
+                                                        melody_prob, (int)(confidence_score * 100));
+                                
+                                if (json_len > 0 && json_len < sizeof(json_buffer)) {
+                                    int msg_id = esp_mqtt_client_publish(mqtt_client, 
+                                                                        MQTT_DETECTION_TOPIC, 
+                                                                        json_buffer, 
+                                                                        json_len, 
+                                                                        0, 0);
+                                    if (msg_id == -1) {
+                                        ESP_LOGW(TAG, "Failed to publish detection JSON to MQTT");
                                     }
                                 } else {
-                                    ESP_LOGW(TAG, "MQTT not connected, skipping detection publish");
+                                    ESP_LOGW(TAG, "JSON buffer overflow or formatting error");
                                 }
-
-                                if (confidence_score >= CONFIDENCE_THRESHOLD) {
-                                    ESP_LOGI(TAG, "*********************");
-                                    ESP_LOGI(TAG, "*** MELODY DETECTED ***");
-                                    ESP_LOGI(TAG, "*********************");
-                                    //is_in_cooldown = true;
-                                    last_trigger_time_ms = esp_timer_get_time() / 1000;
-                                    confidence_score = 0.0f;
-                                }
+                            } else {
+                                ESP_LOGW(TAG, "MQTT not connected, skipping detection publish");
                             }
-                            #endif
+                            if (confidence_score >= CONFIDENCE_THRESHOLD) {
+                                ESP_LOGI(TAG, "*********************");
+                                ESP_LOGI(TAG, "*** MELODY DETECTED ***");
+                                ESP_LOGI(TAG, "*********************");
                             }
                         }
                     }
