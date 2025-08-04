@@ -609,8 +609,8 @@ void spectrogram_task(void* arg) {
                                 if (mqtt_connected && mqtt_client != nullptr) {
                                     char json_buffer[128];
                                     int json_len = snprintf(json_buffer, sizeof(json_buffer), 
-                                                          "{\"melody_prob\": %.5f, \"confidence_score\": %.2f}", 
-                                                          melody_prob, confidence_score);
+                                                          "{\"melody_prob\": %.5f, \"confidence_score\": %d}", 
+                                                          melody_prob, (int)(confidence_score * 100));
                                     
                                     if (json_len > 0 && json_len < sizeof(json_buffer)) {
                                         int msg_id = esp_mqtt_client_publish(mqtt_client, 
