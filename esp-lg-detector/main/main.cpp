@@ -51,6 +51,7 @@ static const char* TAG = "LG_DETECTOR";
 // MQTT Configuration
 #define MQTT_BROKER_URI "mqtt://nas.local:1883"
 #define MQTT_TOPIC "lg-detector/spectrogram"
+#define MQTT_DETECTION_TOPIC "lg-detector/detection"
 
 // Audio settings
 constexpr int SAMPLE_RATE = 16000;
@@ -603,6 +604,29 @@ void spectrogram_task(void* arg) {
                                     if (confidence_score < 0.0f) confidence_score = 0.0f;
                                 }
                                 ESP_LOGI(TAG, " Other: %.5f, Melody Prob: %.5f | Confidence: %.2f", output->data.f[0], melody_prob, confidence_score);
+
+                                // --- Publish detection results as JSON to MQTT ---
+                                if (mqtt_connected && mqtt_client != nullptr) {
+                                    char json_buffer[128];
+                                    int json_len = snprintf(json_buffer, sizeof(json_buffer), 
+                                                          "{\"melody_prob\": %.5f, \"confidence_score\": %.2f}", 
+                                                          melody_prob, confidence_score);
+                                    
+                                    if (json_len > 0 && json_len < sizeof(json_buffer)) {
+                                        int msg_id = esp_mqtt_client_publish(mqtt_client, 
+                                                                           MQTT_DETECTION_TOPIC, 
+                                                                           json_buffer, 
+                                                                           json_len, 
+                                                                           0, 0);
+                                        if (msg_id == -1) {
+                                            ESP_LOGW(TAG, "Failed to publish detection JSON to MQTT");
+                                        }
+                                    } else {
+                                        ESP_LOGW(TAG, "JSON buffer overflow or formatting error");
+                                    }
+                                } else {
+                                    ESP_LOGW(TAG, "MQTT not connected, skipping detection publish");
+                                }
 
                                 if (confidence_score >= CONFIDENCE_THRESHOLD) {
                                     ESP_LOGI(TAG, "*********************");
