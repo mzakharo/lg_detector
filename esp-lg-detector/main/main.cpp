@@ -21,7 +21,7 @@
 
 // DEBUG MODE: 0=normal, 1=sine wave test
 #define DEBUG_MODE 0
-#include "test_vector.h"
+
 // TensorFlow Lite Micro
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -70,7 +70,7 @@ constexpr int HOP_SAMPLES = static_cast<int>(SAMPLE_RATE * HOP_DURATION_S);
 constexpr int FFT_BINS = N_FFT / 2 + 1;
 
 // Confidence Accumulator Parameters (same as before)
-constexpr float PREDICTION_THRESHOLD = 0.80f;
+constexpr float PREDICTION_THRESHOLD = 0.70f;
 constexpr float CONFIDENCE_THRESHOLD = 0.95f;
 constexpr float INCREMENT_AMOUNT = 0.15f;
 constexpr float DECAY_RATE = 0.05f;
@@ -84,7 +84,7 @@ namespace {
     TfLiteTensor* input = nullptr;
     TfLiteTensor* output = nullptr;
 
-    constexpr int kTensorArenaSize = 1 * 1024 * 1024;
+    constexpr int kTensorArenaSize = 128 * 1024;
     //uint8_t tensor_arena[kTensorArenaSize];
 
     // NEW: I2S channel handle for the new driver
@@ -99,7 +99,7 @@ namespace {
     RingbufHandle_t audio_ring_buffer;
     
     // Ring buffer configuration
-    constexpr int AUDIO_RING_BUFFER_SIZE = 8192; // 8KB ring buffer for audio data
+    constexpr int AUDIO_RING_BUFFER_SIZE = 8192*2; // 16KB ring buffer for audio data
 
     // Global Hann window buffer
     float hann_window[N_FFT];
@@ -567,6 +567,8 @@ void spectrogram_task(void* arg) {
                             }
                             printf("--- C++ SPECTROGRAM END ---\\n");
 #endif
+
+#if 0
                             // --- MQTT Streaming: Publish spectrogram data before inference ---
                             if (mqtt_connected && mqtt_client != nullptr) {
                                 int msg_id = esp_mqtt_client_publish(mqtt_client, 
@@ -583,7 +585,7 @@ void spectrogram_task(void* arg) {
                             } else {
                                 ESP_LOGW(TAG, "MQTT not connected, skipping spectrogram publish");
                             }
-
+#endif
                             // --- Run Inference ---
                             memcpy(input->data.f, model_input_buffer, N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
                             #if 1
@@ -715,10 +717,10 @@ void init_tflite() {
     static_resolver.AddRelu();
 
        // Allocate tensor arena in PSRAM if available, otherwise internal RAM
-    //uint8_t * tensor_arena = (uint8_t*)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    uint8_t * tensor_arena = (uint8_t*)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    //uint8_t * tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint8_t * tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (tensor_arena == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate tensor arena in PSRAM, trying internal RAM...");
+        ESP_LOGE(TAG, "Failed to allocate tensor arena");
         return;
     }
     ESP_LOGI(TAG, "Allocated %d bytes for tensor arena", kTensorArenaSize);
