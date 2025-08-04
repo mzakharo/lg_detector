@@ -100,10 +100,9 @@ def on_message(client, userdata, msg):
             return
 
         float_data = struct.unpack(f'<{CONFIG["n_mels"] * CONFIG["max_spectrogram_width"]}f', msg.payload)
-        spectrogram = np.array(float_data).reshape(CONFIG["max_spectrogram_width"], CONFIG["n_mels"])
-        
-        # Transpose to match display format (mel_bins, time_frames)
-        spectrogram = spectrogram.T
+        # The C++ code now sends the spectrogram in the correct [mels, time] orientation.
+        # We just need to reshape it. The old transpose is no longer needed.
+        spectrogram = np.array(float_data).reshape(CONFIG["n_mels"], CONFIG["max_spectrogram_width"])
         
         # The model expects the spectrogram in a specific shape and type
         # Reshape for the model (add batch and channel dimensions)

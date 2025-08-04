@@ -84,7 +84,7 @@ namespace {
     TfLiteTensor* input = nullptr;
     TfLiteTensor* output = nullptr;
 
-    constexpr int kTensorArenaSize = 64 * 1024;
+    constexpr int kTensorArenaSize = 1 * 1024 * 1024;
     //uint8_t tensor_arena[kTensorArenaSize];
 
     // NEW: I2S channel handle for the new driver
@@ -248,7 +248,7 @@ float remove_dc(float input) {
 // --- FIXED: Spectrogram Generation and Detection Task ---
 void init_tflite();
 // REVISED SIGNATURE: Passes a work buffer to avoid stack overflow
-void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectrogram, float* fft_work_buffer);
+void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectrogram, float* fft_work_buffer, float * local_power_spectrum);
 
 #if DEBUG_MODE == 1
 // --- SINE WAVE GENERATOR TASK (replaces I2S reader for testing) ---
@@ -382,23 +382,54 @@ void i2s_reader_task(void* arg) {
 void spectrogram_task(void* arg) {
     // --- Simplified Spectrogram Buffers ---
     // Simple audio buffer to accumulate samples for FFT processing
-    float* audio_accumulator = (float*)malloc(N_FFT * sizeof(float));
+    float* audio_accumulator = (float*) heap_caps_malloc( N_FFT * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (!audio_accumulator) {
+        ESP_LOGE(TAG, "Failed to allocate audio_accumulator!");
+        vTaskDelete(NULL);
+        return;
+    }
+
     int audio_accumulator_count = 0;
     
     // Spectrogram column buffer (circular buffer of columns)
-    float* spectrogram_buffer = (float*)malloc(N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
+    float* spectrogram_buffer = (float*)heap_caps_malloc(N_MELS * SPECTROGRAM_WIDTH * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     int spectrogram_col_head = 0;
     int spectrogram_col_count = 0;
+
+
+    if (!spectrogram_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate spectrogram_buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+
     
     // CRITICAL FIX: Allocate the FFT work buffer in internal RAM for the DSP library.
     // ESP-DSP real FFT requires N_FFT buffer size for real input.
     float* fft_work_buffer = (float*)heap_caps_aligned_alloc(16, N_FFT * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
-    // STACK OVERFLOW FIX: Allocate model input buffer on heap instead of stack
-    float* model_input_buffer = (float*)malloc(N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
+    if (!fft_work_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate fft_work_buffer buffers!");
+        vTaskDelete(NULL);
+        return;
+    }
 
-    if (!audio_accumulator || !spectrogram_buffer || !fft_work_buffer || !model_input_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate one or more buffers!");
+    // STACK OVERFLOW FIX: Allocate model input buffer on heap instead of stack
+    static float model_input_buffer[N_MELS*SPECTROGRAM_WIDTH]; //= (float*)heap_caps_malloc(N_MELS * SPECTROGRAM_WIDTH * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#if 0
+    if (!model_input_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate model_input_buffer!");
+        vTaskDelete(NULL);
+        return;
+    }
+#endif
+
+    // 5. Calculate Power Spectrum from the real FFT output
+    float * local_power_spectrum = (float*)heap_caps_malloc(FFT_BINS* sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (local_power_spectrum == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate local power spectrum");
         vTaskDelete(NULL);
         return;
     }
@@ -460,7 +491,7 @@ void spectrogram_task(void* arg) {
 
                     // Generate one spectrogram column directly from accumulator
                     float* current_column = &spectrogram_buffer[spectrogram_col_head * N_MELS];
-                    generate_spectrogram_frame(audio_accumulator, current_column, fft_work_buffer);
+                    generate_spectrogram_frame(audio_accumulator, current_column, fft_work_buffer, local_power_spectrum);
                     
                     // Shift accumulator by hop size (overlap processing)
                     memmove(audio_accumulator, &audio_accumulator[STREAM_HOP_SAMPLES], (N_FFT - STREAM_HOP_SAMPLES) * sizeof(float));
@@ -487,13 +518,15 @@ void spectrogram_task(void* arg) {
                             if (current_time_ms - last_inference_time_ms > 500) {
                                 last_inference_time_ms = current_time_ms;
                             // --- REVISED NORMALIZATION LOGIC ---
-                            // 1. Reorder the spectrogram from the circular buffer into the linear model_input_buffer
-                            // This creates a coherent snapshot in time for normalization.
-                            for (int col = 0; col < SPECTROGRAM_WIDTH; col++) {
-                                // FIXED: spectrogram_col_head points to the NEXT position to write
-                                // So the oldest column is at spectrogram_col_head, newest is at (spectrogram_col_head - 1)
+                            // 1. Reorder and TRANSPOSE the spectrogram from the circular buffer into the linear model_input_buffer
+                            // The model expects a [MELS, WIDTH] layout, but our buffer is stored as columns [WIDTH, MELS].
+                            for (int col = 0; col < SPECTROGRAM_WIDTH; ++col) {
                                 int src_col_idx = (spectrogram_col_head + col) % SPECTROGRAM_WIDTH;
-                                memcpy(&model_input_buffer[col * N_MELS], &spectrogram_buffer[src_col_idx * N_MELS], N_MELS * sizeof(float));
+                                for (int mel = 0; mel < N_MELS; ++mel) {
+                                    // Transpose operation:
+                                    // Destination[mel, col] = Source[col, mel]
+                                    model_input_buffer[mel * SPECTROGRAM_WIDTH + col] = spectrogram_buffer[src_col_idx * N_MELS + mel];
+                                }
                             }
 
                             // 2. Find the maximum power value *within this coherent snapshot*
@@ -682,8 +715,8 @@ void init_tflite() {
     static_resolver.AddRelu();
 
        // Allocate tensor arena in PSRAM if available, otherwise internal RAM
-    uint8_t * tensor_arena = (uint8_t*)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    //uint8_t * tensor_arena = (uint8_t*)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    //uint8_t * tensor_arena = (uint8_t*)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint8_t * tensor_arena = (uint8_t*)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (tensor_arena == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate tensor arena in PSRAM, trying internal RAM...");
         return;
@@ -708,7 +741,7 @@ void init_tflite() {
 
 // --- FIXED: generate_spectrogram_frame() function ---
 // REVISED to accept a work buffer, preventing stack overflow.
-void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectrogram, float* fft_work_buffer) {
+void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectrogram, float* fft_work_buffer, float* local_power_spectrum) {
     // 1. Apply Hann window and copy to work buffer for real FFT
     for (int i = 0; i < N_FFT; i++) {
         fft_work_buffer[i] = audio_frame[i] * hann_window[i];
@@ -723,8 +756,6 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
     // 4. Convert complex spectrum to real spectrum format
     dsps_cplx2real_fc32(fft_work_buffer, N_FFT >> 1);
     
-    // 5. Calculate Power Spectrum from the real FFT output
-    static float local_power_spectrum[FFT_BINS];
 
     // The output of dsps_cplx2real_fc32 is a packed spectrum.
     // DC component is in fft_work_buffer[0]
