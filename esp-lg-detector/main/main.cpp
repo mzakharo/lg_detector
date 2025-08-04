@@ -56,7 +56,7 @@ constexpr int SAMPLE_RATE = 16000;
 constexpr float WINDOW_DURATION_S = 1.5f;
 constexpr float HOP_DURATION_S = 0.5f;
 constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
-constexpr int I2S_BUFFER_SIZE_BYTES = 4096;
+constexpr int I2S_BUFFER_SIZE_BYTES = 1024;
 
 // Spectrogram settings
 constexpr int N_FFT = 1024;
@@ -106,7 +106,7 @@ namespace {
     QueueHandle_t empty_audio_queue;
 
     // Statically allocated audio buffers
-    constexpr int NUM_AUDIO_BUFFERS = 4;
+    constexpr int NUM_AUDIO_BUFFERS = 8;
     int16_t* audio_buffers[NUM_AUDIO_BUFFERS];
 
     // Global Hann window buffer
@@ -124,8 +124,8 @@ namespace {
 void init_pdm_microphone() {
     // 1. Create a new I2S channel
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 3;
-    chan_cfg.dma_frame_num = 300;
+    //chan_cfg.dma_desc_num = 3;
+    //chan_cfg.dma_frame_num = 300;
  
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_chan));
 
@@ -137,18 +137,17 @@ void init_pdm_microphone() {
             .clk = PDM_CLK_PIN,
             .din = PDM_DATA_PIN,
             .invert_flags = {
-                .clk_inv = true,
+                .clk_inv = false,
             },
         },
     };
-        // Configure for mono recording (single microphone)
-    //pdm_rx_cfg.slot_cfg.slot_mask = I2S_PDM_SLOT_LEFT;  // Use left slot
- 
 
     ESP_ERROR_CHECK(i2s_channel_init_pdm_rx_mode(rx_chan, &pdm_rx_cfg));
 
     // 3. Enable the channel
     ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+
+
     ESP_LOGI(TAG, "PDM microphone initialized successfully.");
 }
 
@@ -726,7 +725,7 @@ void i2s_reader_task(void* arg) {
     while (true) {
         // Check queue status before reading
         UBaseType_t filled_queue_size = uxQueueMessagesWaiting(filled_audio_queue);
-        if (filled_queue_size > 1) {
+        if (filled_queue_size > NUM_AUDIO_BUFFERS - 1) {
             ESP_LOGW(TAG, "Reader task: Pipeline is lagging! %d buffers waiting.", filled_queue_size);
         }
 
@@ -740,17 +739,10 @@ void i2s_reader_task(void* arg) {
                 xQueueSend(empty_audio_queue, &i2s_read_buffer, 0);
                 continue; // Skip to next loop iteration
             }
-            
-            if (bytes_read > 0) {
-                // Calculate RMS for power level
-                int64_t sum_squares = 0;
-                int samples_read = bytes_read / sizeof(int16_t);
-                for (int i = 0; i < samples_read; i++) {
-                    sum_squares += (int64_t)i2s_read_buffer[i] * i2s_read_buffer[i];
-                }
-                float rms = sqrtf((float)sum_squares / samples_read);
-                //ESP_LOGI(TAG, "Mic Power (RMS): %.2f", rms);
 
+            ESP_LOGI(TAG, "%d %d %d %d", i2s_read_buffer[0], i2s_read_buffer[1],i2s_read_buffer[2],i2s_read_buffer[3]);
+            
+            if (bytes_read == I2S_BUFFER_SIZE_BYTES) {
                 // Send the filled buffer to the processing task
                 if (xQueueSend(filled_audio_queue, &i2s_read_buffer, 0) != pdPASS) { // Use 0 timeout
                     ESP_LOGE(TAG, "Filled audio queue is full! Dropping buffer.");
@@ -855,9 +847,12 @@ void spectrogram_task(void* arg) {
             // 2. Add new samples to the audio ring buffer (with DC removal and pre-emphasis)
             for (int i = 0; i < samples_read; i++) {
 
-                float current_sample = (float)i2s_read_buffer[i] / 32768.0f;;
+                float current_sample = (float)i2s_read_buffer[i] / 32768.0f;
                 audio_ring_buffer[audio_ring_head] = current_sample;
-                
+
+                if (i < 4){
+                    ESP_LOGI(TAG, "sample %d", i2s_read_buffer[i]);
+                }
                 audio_ring_head = (audio_ring_head + 1) % AUDIO_RING_SIZE;
                 
                 if (audio_ring_count < AUDIO_RING_SIZE) {
@@ -891,6 +886,7 @@ void spectrogram_task(void* arg) {
 
                     // 4. Run inference when we have a full spectrogram
                     if (spectrogram_col_count == SPECTROGRAM_WIDTH) {
+                        spectrogram_col_count -= SPECTROGRAM_WIDTH/4;
                         // --- Cooldown Logic ---
                         if (is_in_cooldown && (esp_timer_get_time() / 1000 - last_trigger_time_ms > COOLDOWN_SECONDS * 1000)) {
                             is_in_cooldown = false;
@@ -951,11 +947,11 @@ void spectrogram_task(void* arg) {
 #endif
                             // --- MQTT Streaming: Publish spectrogram data before inference ---
                             if (mqtt_connected && mqtt_client != nullptr) {
-                                int msg_id = esp_mqtt_client_enqueue(mqtt_client, 
+                                int msg_id = esp_mqtt_client_publish(mqtt_client, 
                                                                    MQTT_TOPIC, 
                                                                    (char*)model_input_buffer, 
                                                                    N_MELS * SPECTROGRAM_WIDTH * sizeof(float), 
-                                                                   0, 0, true);
+                                                                   0, 0);
                                 if (msg_id == -1) {
                                     ESP_LOGW(TAG, "Failed to publish spectrogram data to MQTT");
                                 } else {
@@ -1042,7 +1038,7 @@ extern "C" void app_main() {
 
     // Allocate and populate the empty audio queue
     for (int i = 0; i < NUM_AUDIO_BUFFERS; i++) {
-        audio_buffers[i] = (int16_t*)malloc(I2S_BUFFER_SIZE_BYTES);
+        audio_buffers[i] = (int16_t*) heap_caps_malloc(I2S_BUFFER_SIZE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!audio_buffers[i]) {
             ESP_LOGE(TAG, "Failed to allocate audio buffer %d", i);
             return;
@@ -1050,11 +1046,12 @@ extern "C" void app_main() {
         xQueueSend(empty_audio_queue, &audio_buffers[i], 0);
     }
 
-    init_pdm_microphone();
 
     // Initialize WiFi and MQTT
     init_wifi();
     init_mqtt();
+
+    init_pdm_microphone();
 
 #if DEBUG_MODE == 1
     // Microphone debug mode
@@ -1077,6 +1074,7 @@ extern "C" void app_main() {
 #else
     // Normal mode: Run full detection pipeline
     init_tflite();
+
     xTaskCreatePinnedToCore(i2s_reader_task, "i2s_reader_task", 1024 * 4, NULL, 10, NULL, 0);
     xTaskCreatePinnedToCore(spectrogram_task, "spectrogram_task", 1024 * 8, NULL, 5, NULL, 1);
 #endif
