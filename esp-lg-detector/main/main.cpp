@@ -12,6 +12,12 @@
 #include "driver/gpio.h" // For GPIO configuration
 #include "esp_heap_caps.h" // For heap_caps_malloc
 
+// WiFi and MQTT includes
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "mqtt_client.h"
+
 // DEBUG MODE: 0=normal, 1=microphone test, 2=spectrogram debug, 3=sine wave test, 4=dump audio
 #define DEBUG_MODE 0
 #include "test_vector.h"
@@ -36,6 +42,14 @@ extern const int ___lg_sound_model_tflite_len;
 
 // --- CONFIGURATION (MUST MATCH PYTHON SCRIPT) ---
 static const char* TAG = "LG_DETECTOR";
+
+// WiFi Configuration
+#define WIFI_SSID "wireless"
+#define WIFI_PASS ""
+
+// MQTT Configuration
+#define MQTT_BROKER_URI "mqtt://nas.local:1883"
+#define MQTT_TOPIC "lg-detector/spectrogram"
 
 // Audio settings
 constexpr int SAMPLE_RATE = 16000;
@@ -97,6 +111,11 @@ namespace {
 
     // Global Hann window buffer
     float hann_window[N_FFT];
+
+    // WiFi and MQTT globals
+    esp_mqtt_client_handle_t mqtt_client = nullptr;
+    bool wifi_connected = false;
+    bool mqtt_connected = false;
 }
 #define PDM_CLK_PIN     (GPIO_NUM_42)  // PDM Clock
 #define PDM_DATA_PIN    (GPIO_NUM_41)  // PDM Data
@@ -131,6 +150,96 @@ void init_pdm_microphone() {
     // 3. Enable the channel
     ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
     ESP_LOGI(TAG, "PDM microphone initialized successfully.");
+}
+
+// --- WiFi Event Handler ---
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_connected = false;
+        ESP_LOGI(TAG, "WiFi disconnected, attempting to reconnect...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "WiFi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        wifi_connected = true;
+    }
+}
+
+// --- MQTT Event Handler ---
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+    
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT connected to broker");
+            mqtt_connected = true;
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "MQTT disconnected from broker");
+            mqtt_connected = false;
+            break;
+        case MQTT_EVENT_ERROR:
+            ESP_LOGI(TAG, "MQTT error occurred");
+            mqtt_connected = false;
+            break;
+        default:
+            break;
+    }
+}
+
+// --- WiFi Initialization ---
+void init_wifi() {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    esp_netif_create_default_wifi_sta();
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+    
+    wifi_config_t wifi_config = {};
+    strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
+    strcpy((char*)wifi_config.sta.password, WIFI_PASS);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;  // Open network
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    ESP_LOGI(TAG, "WiFi initialization complete. Connecting to %s...", WIFI_SSID);
+}
+
+// --- MQTT Initialization ---
+void init_mqtt() {
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri = MQTT_BROKER_URI;
+    
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (mqtt_client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client");
+        return;
+    }
+    
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(mqtt_client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
+    
+    ESP_LOGI(TAG, "MQTT client initialized and started");
 }
 
 // --- FIXED: Spectrogram Generation and Detection Task ---
@@ -618,7 +727,7 @@ void i2s_reader_task(void* arg) {
         // Check queue status before reading
         UBaseType_t filled_queue_size = uxQueueMessagesWaiting(filled_audio_queue);
         if (filled_queue_size > 1) {
-            //ESP_LOGW(TAG, "Reader task: Pipeline is lagging! %d buffers waiting.", filled_queue_size);
+            ESP_LOGW(TAG, "Reader task: Pipeline is lagging! %d buffers waiting.", filled_queue_size);
         }
 
         // Wait for an empty buffer from the queue
@@ -745,26 +854,10 @@ void spectrogram_task(void* arg) {
 
             // 2. Add new samples to the audio ring buffer (with DC removal and pre-emphasis)
             for (int i = 0; i < samples_read; i++) {
-                // Normalize the 16-bit sample to a float
-                float current_sample = (float)i2s_read_buffer[i] / 32768.0f;
-                
-                // Apply DC removal high-pass filter first
-                // y[n] = x[n] - x[n-1] + α * y[n-1]
-                float dc_filtered_sample = current_sample - dc_filter_prev_input + DC_FILTER_ALPHA * dc_filter_prev_output;
-                
-                // Update DC filter state
-                dc_filter_prev_input = current_sample;
-                dc_filter_prev_output = dc_filtered_sample;
-                
-                // Apply pre-emphasis filter to boost high frequencies
-                float filtered_sample = dc_filtered_sample - PRE_EMPHASIS_ALPHA * previous_sample;
-                
-                // Store the filtered sample in the ring buffer
-                audio_ring_buffer[audio_ring_head] = current_sample;//filtered_sample;
-                
-                // Update the previous sample for the next iteration
-                previous_sample = dc_filtered_sample;
 
+                float current_sample = (float)i2s_read_buffer[i] / 32768.0f;;
+                audio_ring_buffer[audio_ring_head] = current_sample;
+                
                 audio_ring_head = (audio_ring_head + 1) % AUDIO_RING_SIZE;
                 
                 if (audio_ring_count < AUDIO_RING_SIZE) {
@@ -856,6 +949,23 @@ void spectrogram_task(void* arg) {
                             }
                             printf("--- C++ SPECTROGRAM END ---\\n");
 #endif
+                            // --- MQTT Streaming: Publish spectrogram data before inference ---
+                            if (mqtt_connected && mqtt_client != nullptr) {
+                                int msg_id = esp_mqtt_client_enqueue(mqtt_client, 
+                                                                   MQTT_TOPIC, 
+                                                                   (char*)model_input_buffer, 
+                                                                   N_MELS * SPECTROGRAM_WIDTH * sizeof(float), 
+                                                                   0, 0, true);
+                                if (msg_id == -1) {
+                                    ESP_LOGW(TAG, "Failed to publish spectrogram data to MQTT");
+                                } else {
+                                    ESP_LOGI(TAG, "Published spectrogram data (%d bytes) to MQTT, msg_id=%d", 
+                                             N_MELS * SPECTROGRAM_WIDTH * sizeof(float), msg_id);
+                                }
+                            } else {
+                                ESP_LOGW(TAG, "MQTT not connected, skipping spectrogram publish");
+                            }
+
                             // --- Run Inference ---
                             memcpy(input->data.f, model_input_buffer, N_MELS * SPECTROGRAM_WIDTH * sizeof(float));
                             #if 1
@@ -878,7 +988,7 @@ void spectrogram_task(void* arg) {
                                     ESP_LOGI(TAG, "*********************");
                                     ESP_LOGI(TAG, "*** MELODY DETECTED ***");
                                     ESP_LOGI(TAG, "*********************");
-                                    is_in_cooldown = true;
+                                    //is_in_cooldown = true;
                                     last_trigger_time_ms = esp_timer_get_time() / 1000;
                                     confidence_score = 0.0f;
                                 }
@@ -942,6 +1052,10 @@ extern "C" void app_main() {
 
     init_pdm_microphone();
 
+    // Initialize WiFi and MQTT
+    init_wifi();
+    init_mqtt();
+
 #if DEBUG_MODE == 1
     // Microphone debug mode
     xTaskCreatePinnedToCore(i2s_reader_task, "i2s_reader_task", 1024 * 4, NULL, 10, NULL, 0);
@@ -1000,7 +1114,8 @@ void init_tflite() {
     static_resolver.AddRelu();
 
        // Allocate tensor arena in PSRAM if available, otherwise internal RAM
-    uint8_t * tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    //uint8_t * tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint8_t * tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (tensor_arena == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate tensor arena in PSRAM, trying internal RAM...");
         return;
