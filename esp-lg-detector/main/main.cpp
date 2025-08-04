@@ -686,8 +686,8 @@ void spectrogram_task(void* arg) {
     int spectrogram_col_count = 0;
     
     // CRITICAL FIX: Allocate the FFT work buffer in internal RAM for the DSP library.
-    // ESP-DSP real FFT requires 2*N_FFT buffer size for complex output
-    float* fft_work_buffer = (float*)heap_caps_malloc(2 * N_FFT * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    // ESP-DSP real FFT requires N_FFT buffer size for real input.
+    float* fft_work_buffer = (float*)heap_caps_malloc(N_FFT * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
     // STACK OVERFLOW FIX: Allocate audio frame buffer on heap instead of stack
     float* audio_frame_buffer = (float*)malloc(N_FFT * sizeof(float));
@@ -903,6 +903,11 @@ extern "C" void app_main() {
         ESP_LOGE(TAG, "FFT init failed: %s", esp_err_to_name(ret));
         return;
     }
+    ret = dsps_fft4r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "FFT4R init failed: %s", esp_err_to_name(ret));
+        return;
+    }
     ESP_LOGI(TAG, "FFT tables initialized successfully");
 
     // Pre-calculate the Hann window
@@ -1021,65 +1026,38 @@ void init_tflite() {
 // --- FIXED: generate_spectrogram_frame() function ---
 // REVISED to accept a work buffer, preventing stack overflow.
 void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectrogram, float* fft_work_buffer) {
-   
-    
-    // 1. Apply Hann window to filtered audio frame and convert to complex format
-    // dsps_fft2r_fc32 expects complex input (interleaved real/imaginary pairs)
+    // 1. Apply Hann window and copy to work buffer for real FFT
     for (int i = 0; i < N_FFT; i++) {
-        fft_work_buffer[i * 2 + 0] = audio_frame[i] * hann_window[i]; // Real part
-        fft_work_buffer[i * 2 + 1] = 0.0f;                            // Imaginary part (zero for real input)
+        fft_work_buffer[i] = audio_frame[i] * hann_window[i];
     }
 
-    // 2. Perform FFT using ESP-DSP library
-    // dsps_fft2r_fc32 expects complex input data (interleaved real/imag pairs)
-    // Input: Complex data (real/imag interleaved) in the buffer
-    // Output: Complex data (real/imag interleaved) in the same buffer
-    esp_err_t fft_result = dsps_fft2r_fc32(fft_work_buffer, N_FFT);
+    // 2. Perform real FFT using ESP-DSP library
+    dsps_fft2r_fc32(fft_work_buffer, N_FFT >> 1);
     
-    if (fft_result != ESP_OK) {
-        ESP_LOGE(TAG, "FFT failed with error %d", fft_result);
-        // Set all outputs to silence if FFT fails
-        for (int i = 0; i < N_MELS; i++) {
-            out_mel_spectrogram[i] = -60.0f;
-        }
-        return;
-    }
-    
-    // Apply bit reversal to get the correct frequency order
-    dsps_bit_rev_fc32(fft_work_buffer, N_FFT);
+    // 3. Bit reverse for real FFT
+    dsps_bit_rev2r_fc32(fft_work_buffer, N_FFT >> 1);
 
+    // 4. Convert complex spectrum to real spectrum format
+    dsps_cplx2real_fc32(fft_work_buffer, N_FFT >> 1);
     
-    // DEBUG: Log FFT output
-    //ESP_LOGI(TAG, "FFT output: %.2e %.2e %.2e %.2e", fft_work_buffer[0], fft_work_buffer[1], fft_work_buffer[2], fft_work_buffer[3]);
-       
-    // Librosa's stft normalizes by the sum of the squared window.
-    // For a Hann window, this sum is N_FFT * 3/8.
-    // We apply this normalization to the power spectrum.
-    //const float stft_normalization_factor = 1.0f / (float)(N_FFT * 3.0f / 8.0f);
-
+    // 5. Calculate Power Spectrum from the real FFT output
     static float local_power_spectrum[FFT_BINS];
     memset(local_power_spectrum, 0, sizeof(local_power_spectrum));
     
-    // 3. Calculate Power Spectrum from FFT output
-    // This is |c|^2 for each complex bin c.
-    // The result is the power of the signal at each frequency bin.
-    // DC component (first bin)
-    local_power_spectrum[0] = fft_work_buffer[0] * fft_work_buffer[0]; // Real part only
-    
-    // Positive frequencies (up to Nyquist)
+    // The output of dsps_cplx2real_fc32 is a packed spectrum.
+    // DC component is in fft_work_buffer[0]
+    // Nyquist component is in fft_work_buffer[1]
+    // The rest are complex values.
+    local_power_spectrum[0] = fft_work_buffer[0] * fft_work_buffer[0];
+    local_power_spectrum[N_FFT / 2] = fft_work_buffer[1] * fft_work_buffer[1];
+
     for (int i = 1; i < N_FFT / 2; i++) {
         float real = fft_work_buffer[i * 2];
         float imag = fft_work_buffer[i * 2 + 1];
         local_power_spectrum[i] = (real * real + imag * imag);
     }
-    
-    // Nyquist frequency (last bin)
-    float nyquist_real = fft_work_buffer[N_FFT]; // Real part only
-    local_power_spectrum[N_FFT / 2] = (nyquist_real * nyquist_real);
 
-
- 
-    // 4. Apply Mel Filterbank with overflow protection
+    // 6. Apply Mel Filterbank with overflow protection
     for (int i = 0; i < N_MELS; i++) {
         float mel_value = 0.0; 
         for (int j = 0; j < FFT_BINS; j++) {
@@ -1093,7 +1071,7 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
         } else if (mel_value < 0.0) {
             out_mel_spectrogram[i] = 0.0f;
         } else {
-            out_mel_spectrogram[i] = mel_value;// local_power_spectrum[8*i] + local_power_spectrum[8*i+1] + local_power_spectrum[8*i+2] + local_power_spectrum[8*i+3] + local_power_spectrum[8*i+4] + local_power_spectrum[8*i+5] + local_power_spectrum[8*i+6] + local_power_spectrum[8*i+7];
+            out_mel_spectrogram[i] = mel_value;
         }
     } 
 }
