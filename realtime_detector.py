@@ -2,6 +2,10 @@ import sounddevice as sd
 import numpy as np
 import librosa
 import tensorflow as tf
+import paho.mqtt.client as mqtt
+import struct
+import argparse
+
 
 #import tflite_runtime.interpreter as tflite
 import queue
@@ -31,6 +35,7 @@ CONFIDENCE_PARAMS = {
 
 # Global variables for the audio stream and processing
 audio_queue = queue.Queue()
+spectrogram_queue = queue.Queue()
 confidence_score = 0.0
 is_in_cooldown = False
 last_trigger_time = 0
@@ -70,8 +75,54 @@ def preprocess_window(audio_window, config):
     return log_spectrogram.astype(np.float32)[np.newaxis, ..., np.newaxis]
 
 
+def on_connect(client, userdata, flags, rc):
+    """The callback for when the client receives a CONNACK response from the server."""
+    if rc == 0:
+        print("Connected to MQTT Broker!")
+        client.subscribe(CONFIG["mqtt_topic"])
+        print(f"Subscribed to topic: {CONFIG['mqtt_topic']}")
+    else:
+        print(f"Failed to connect, return code {rc}\n")
+
+def on_message(client, userdata, msg):
+    """The callback for when a PUBLISH message is received from the server."""
+    try:
+        # ESP32 sends as little-endian float32
+        expected_bytes = CONFIG["n_mels"] * CONFIG["max_spectrogram_width"] * 4
+        if len(msg.payload) != expected_bytes:
+            print(f"Warning: Received {len(msg.payload)} bytes, expected {expected_bytes}")
+            return
+
+        float_data = struct.unpack(f'<{CONFIG["n_mels"] * CONFIG["max_spectrogram_width"]}f', msg.payload)
+        spectrogram = np.array(float_data).reshape(CONFIG["max_spectrogram_width"], CONFIG["n_mels"])
+        
+        # Transpose to match display format (mel_bins, time_frames)
+        spectrogram = spectrogram.T
+        
+        # The model expects the spectrogram in a specific shape and type
+        # Reshape for the model (add batch and channel dimensions)
+        spectrogram = spectrogram.astype(np.float32)[np.newaxis, ..., np.newaxis]
+        
+        spectrogram_queue.put(spectrogram)
+
+    except Exception as e:
+        print(f"Error processing MQTT message: {e}")
+
+
 def main():
     global confidence_score, is_in_cooldown, last_trigger_time
+
+    parser = argparse.ArgumentParser(description='Real-time LG sound detector.')
+    parser.add_argument('--input', type=str, default='mic', choices=['mic', 'mqtt'],
+                        help="Input source: 'mic' for microphone or 'mqtt' for MQTT.")
+    parser.add_argument('--broker', type=str, default='nas.local', help='MQTT broker address.')
+    parser.add_argument('--topic', type=str, default='lg-detector/spectrogram', help='MQTT topic for spectrograms.')
+    args = parser.parse_args()
+
+    CONFIG["input_source"] = args.input
+    CONFIG["mqtt_broker"] = args.broker
+    CONFIG["mqtt_topic"] = args.topic
+
 
     # --- SETUP ---
     print("Loading TFLite model...")
@@ -88,67 +139,87 @@ def main():
     audio_buffer = np.array([], dtype=np.float32)
 
     # --- START REAL-TIME PROCESSING ---
-    try:
+    if CONFIG["input_source"] == 'mqtt':
+        print(f"\nConnecting to MQTT broker at {CONFIG['mqtt_broker']}...")
+        client = mqtt.Client()
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.connect(CONFIG['mqtt_broker'], 1883, 60)
+        client.loop_start()
+    else:
         print("\nStarting microphone stream... Press Ctrl+C to stop.")
         stream = sd.InputStream(
-            callback=audio_callback, 
-            channels=1, 
+            callback=audio_callback,
+            channels=1,
             samplerate=CONFIG["sample_rate"],
             dtype='float32'
         )
-        with stream:
-            while True:
-                # Get audio data from the queue (put there by the callback)
+        stream.start()
+
+    try:
+        while True:
+            spectrogram = None
+            if CONFIG["input_source"] == 'mic':
+                 # Get audio data from the queue (put there by the callback)
                 new_audio = audio_queue.get()
                 audio_buffer = np.append(audio_buffer, new_audio)
 
                 # Process the buffer only if we have enough data for a full window
                 while len(audio_buffer) >= window_samples:
-                    # 1. Handle Cooldown
-                    if is_in_cooldown and (librosa.time_to_samples(CONFIDENCE_PARAMS["cooldown_seconds"], sr=CONFIG["sample_rate"]) < (len(audio_buffer) - last_trigger_time)):
-                         is_in_cooldown = False
-                         print("Cooldown finished. Resuming detection.")
-
-                    if not is_in_cooldown:
-                        # 2. Preprocess a window of audio
-                        window = audio_buffer[:window_samples]
-                        spectrogram = preprocess_window(window, CONFIG)
-
-                        # 3. Run Inference
-                        interpreter.set_tensor(input_details[0]['index'], spectrogram)
-                        interpreter.invoke()
-                        prediction = interpreter.get_tensor(output_details[0]['index'])[0]
-                        
-                        print('prediction', prediction)
-                        # Assuming the 'lg_melody' class is the second one
-                        melody_prob = prediction[1]
-
-                        # 4. Update Confidence Score
-                        if melody_prob > CONFIDENCE_PARAMS["prediction_threshold"]:
-                            confidence_score += CONFIDENCE_PARAMS["increment_amount"]
-                            confidence_score = min(confidence_score, 1.0)
-                        else:
-                            confidence_score -= CONFIDENCE_PARAMS["decay_rate"]
-                            confidence_score = max(confidence_score, 0.0)
-                        
-                        # Print status update
-                        print(f"\rMelody Probability: {melody_prob:.2f} | Confidence: [{confidence_score:.2f}] {'#' * int(confidence_score * 20):<20}", end="")
-
-                        # 5. Check for Trigger
-                        if confidence_score >= CONFIDENCE_PARAMS["confidence_threshold"]:
-                            print("\n\n*** MELODY DETECTED! ***\n")
-                            is_in_cooldown = True
-                            last_trigger_time = len(audio_buffer) # Mark time by buffer position
-                            confidence_score = 0.0 # Reset immediately
-                            # You could add other actions here (e.g., send a notification)
-                    
+                    # 2. Preprocess a window of audio
+                    window = audio_buffer[:window_samples]
+                    spectrogram = preprocess_window(window, CONFIG)                    
                     # 6. Slide the buffer forward by the hop amount
                     audio_buffer = audio_buffer[hop_samples:]
 
+            else: # mqtt
+                spectrogram = spectrogram_queue.get()
+
+
+            if spectrogram is not None:
+                print(spectrogram.shape)
+                # 3. Run Inference
+                interpreter.set_tensor(input_details[0]['index'], spectrogram)
+                interpreter.invoke()
+                prediction = interpreter.get_tensor(output_details[0]['index'])[0]
+                
+                print('prediction', prediction)
+                # Assuming the 'lg_melody' class is the second one
+                melody_prob = prediction[1]
+
+                # 4. Update Confidence Score
+                if melody_prob > CONFIDENCE_PARAMS["prediction_threshold"]:
+                    confidence_score += CONFIDENCE_PARAMS["increment_amount"]
+                    confidence_score = min(confidence_score, 1.0)
+                else:
+                    confidence_score -= CONFIDENCE_PARAMS["decay_rate"]
+                    confidence_score = max(confidence_score, 0.0)
+                
+                # Print status update
+                print(f"\rMelody Probability: {melody_prob:.2f} | Confidence: [{confidence_score:.2f}] {'#' * int(confidence_score * 20):<20}", end="")
+
+                # 5. Check for Trigger
+                if confidence_score >= CONFIDENCE_PARAMS["confidence_threshold"]:
+                    print("\n\n*** MELODY DETECTED! ***\n")
+                    last_trigger_time = len(audio_buffer) # Mark time by buffer position
+                    confidence_score = 0.0 # Reset immediately
+                    # You could add other actions here (e.g., send a notification)
+            
+
     except KeyboardInterrupt:
         print("\nStopping...")
+        if CONFIG["input_source"] == 'mqtt':
+            client.loop_stop()
+        elif 'stream' in locals() and stream:
+            stream.stop()
+            stream.close()
     except Exception as e:
         print(f"An error occurred: {e}")
+        if CONFIG["input_source"] == 'mqtt':
+            client.loop_stop()
+        elif 'stream' in locals() and stream:
+            stream.stop()
+            stream.close()
 
 if __name__ == "__main__":
     main()
