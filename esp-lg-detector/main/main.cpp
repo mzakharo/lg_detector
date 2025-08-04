@@ -658,6 +658,11 @@ void i2s_reader_task(void* arg) {
 #endif
 
 void spectrogram_task(void* arg) {
+    // --- DC Removal High-Pass Filter State ---
+    constexpr float DC_FILTER_ALPHA = 0.995f;  // High-pass filter coefficient (cutoff ~50Hz at 16kHz)
+    float dc_filter_prev_input = 0.0f;
+    float dc_filter_prev_output = 0.0f;
+    
     // --- Pre-emphasis Filter State ---
     constexpr float PRE_EMPHASIS_ALPHA = 0.97f;
     float previous_sample = 0.0f;
@@ -738,19 +743,27 @@ void spectrogram_task(void* arg) {
         if (xQueueReceive(filled_audio_queue, &i2s_read_buffer, pdMS_TO_TICKS(100)) == pdPASS) {
             int samples_read = I2S_BUFFER_SIZE_BYTES / sizeof(int16_t);
 
-            // 2. Add new samples to the audio ring buffer (with pre-emphasis)
+            // 2. Add new samples to the audio ring buffer (with DC removal and pre-emphasis)
             for (int i = 0; i < samples_read; i++) {
                 // Normalize the 16-bit sample to a float
                 float current_sample = (float)i2s_read_buffer[i] / 32768.0f;
                 
+                // Apply DC removal high-pass filter first
+                // y[n] = x[n] - x[n-1] + α * y[n-1]
+                float dc_filtered_sample = current_sample - dc_filter_prev_input + DC_FILTER_ALPHA * dc_filter_prev_output;
+                
+                // Update DC filter state
+                dc_filter_prev_input = current_sample;
+                dc_filter_prev_output = dc_filtered_sample;
+                
                 // Apply pre-emphasis filter to boost high frequencies
-                float filtered_sample = current_sample - PRE_EMPHASIS_ALPHA * previous_sample;
+                float filtered_sample = dc_filtered_sample - PRE_EMPHASIS_ALPHA * previous_sample;
                 
                 // Store the filtered sample in the ring buffer
-                audio_ring_buffer[audio_ring_head] = filtered_sample;
+                audio_ring_buffer[audio_ring_head] = current_sample;//filtered_sample;
                 
                 // Update the previous sample for the next iteration
-                previous_sample = current_sample;
+                previous_sample = dc_filtered_sample;
 
                 audio_ring_head = (audio_ring_head + 1) % AUDIO_RING_SIZE;
                 
@@ -885,7 +898,7 @@ void spectrogram_task(void* arg) {
 
 extern "C" void app_main() {
     ESP_LOGI(TAG, "Initializing FFT tables for N_FFT=%d...", N_FFT);
-    esp_err_t ret = dsps_fft2r_init_fc32(NULL, N_FFT);
+    esp_err_t ret = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "FFT init failed: %s", esp_err_to_name(ret));
         return;
@@ -1035,6 +1048,7 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
     // Apply bit reversal to get the correct frequency order
     dsps_bit_rev_fc32(fft_work_buffer, N_FFT);
 
+    
     // DEBUG: Log FFT output
     //ESP_LOGI(TAG, "FFT output: %.2e %.2e %.2e %.2e", fft_work_buffer[0], fft_work_buffer[1], fft_work_buffer[2], fft_work_buffer[3]);
        
@@ -1044,6 +1058,7 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
     //const float stft_normalization_factor = 1.0f / (float)(N_FFT * 3.0f / 8.0f);
 
     static float local_power_spectrum[FFT_BINS];
+    memset(local_power_spectrum, 0, sizeof(local_power_spectrum));
     
     // 3. Calculate Power Spectrum from FFT output
     // This is |c|^2 for each complex bin c.
@@ -1078,7 +1093,7 @@ void generate_spectrogram_frame(const float* audio_frame, float* out_mel_spectro
         } else if (mel_value < 0.0) {
             out_mel_spectrogram[i] = 0.0f;
         } else {
-            out_mel_spectrogram[i] = local_power_spectrum[4*i] + local_power_spectrum[4*i+1] + local_power_spectrum[4*i+2] + local_power_spectrum[4*i+3];
+            out_mel_spectrogram[i] = mel_value;// local_power_spectrum[8*i] + local_power_spectrum[8*i+1] + local_power_spectrum[8*i+2] + local_power_spectrum[8*i+3] + local_power_spectrum[8*i+4] + local_power_spectrum[8*i+5] + local_power_spectrum[8*i+6] + local_power_spectrum[8*i+7];
         }
     } 
 }

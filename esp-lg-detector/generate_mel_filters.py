@@ -18,7 +18,7 @@ def generate_mel_filterbank_header(filename="mel_filters.h"):
         fmax=FMAX,
         norm='slaney', # Use 'slaney' norm if your training used it
     ).T # Transpose to get shape [n_fft // 2 + 1, n_mels]
-
+    print(mel_filters.shape)
     with open(filename, 'w') as f:
         f.write("#pragma once\n\n")
         f.write("#include <cstdint>\n\n")
