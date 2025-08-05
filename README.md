@@ -151,7 +151,7 @@ Enable debug output in ESP32:
 ```cpp
 #define DEBUG_MODE 1  // Sine wave test mode
 
-#define SEPCTOGRAM_DEBUG  // Output spectogram over MQTT
+#define SEPCTOGRAM_DEBUG  // Output spectrogram over MQTT
 ```
 
 ### Visualization
